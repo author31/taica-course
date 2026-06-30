@@ -1,6 +1,7 @@
 .PHONY: install install-dev test \
 	submodules submodules-pull \
 	build-isaaclab launch-isaaclab \
+	build-legacy-isaacsim launch-legacy-isaacsim \
 	launch-isaaclab-glowsai-4090 launch-isaaclab-glowsai-l40s \
 	check-isaaclab-gpu
 
@@ -9,6 +10,11 @@ IMAGE          ?= leisaac-isaaclab:latest
 DOCKERFILE     ?= Dockerfile
 GPU            ?= all
 CONTAINER_NAME ?= isaaclab
+
+# Legacy stack: Isaac Sim 4.5.0 / Isaac Lab 2.1.1 / Python 3.10.
+LEGACY_IMAGE          ?= leisaac-isaacsim:legacy
+LEGACY_DOCKERFILE     ?= Dockerfile.legacy-isaacsim
+LEGACY_CONTAINER_NAME ?= isaacsim-legacy
 
 # ---- Shared shell snippets ---------------------------------------------------
 # Pick first existing NVIDIA Vulkan ICD and export VK_ICD_FILENAMES.
@@ -84,6 +90,43 @@ launch-isaaclab: build-isaaclab
 		-e NVIDIA_VISIBLE_DEVICES=$(GPU) \
 		-e NVIDIA_DRIVER_CAPABILITIES=graphics,display,utility,compute \
 		$(IMAGE) \
+		bash -lc '\
+			set -e; \
+			echo "== GPU check =="; nvidia-smi || true; \
+			echo "== Vulkan ICD candidates =="; \
+			ls -l /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>/dev/null || true; \
+			$(select_vulkan_icd); \
+			$(require_runtime_libs); \
+			cd /workspace/aicapstone; \
+			exec /bin/bash \
+		'
+
+# ---- Launch: legacy (Isaac Sim 4.5.0 / Isaac Lab 2.1.1) ----------------------
+# The legacy image clones Isaac Lab v2.1.1 itself, so no submodule dependency.
+build-legacy-isaacsim:
+	docker build -f $(LEGACY_DOCKERFILE) -t $(LEGACY_IMAGE) .
+
+launch-legacy-isaacsim: build-legacy-isaacsim
+	@set -e; \
+	xhost +local:root >/dev/null || true; \
+	trap 'xhost -local:root >/dev/null || true' EXIT; \
+	docker run --rm -it \
+		--name $(LEGACY_CONTAINER_NAME) \
+		--gpus '"device=0"' \
+		--net=host \
+		--ipc=host \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
+		-v $(shell pwd):/workspace/aicapstone \
+		-v /workspace/aicapstone/.venv \
+		-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+		-e DISPLAY=$$DISPLAY \
+		-e OMNI_KIT_ACCEPT_EULA=Y \
+		-e PRIVACY_CONSENT=Y \
+		-e QT_X11_NO_MITSHM=1 \
+		-e NVIDIA_VISIBLE_DEVICES=$(GPU) \
+		-e NVIDIA_DRIVER_CAPABILITIES=graphics,display,utility,compute \
+		$(LEGACY_IMAGE) \
 		bash -lc '\
 			set -e; \
 			echo "== GPU check =="; nvidia-smi || true; \
