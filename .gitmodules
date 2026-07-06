@@ -1,3 +1,6 @@
 [submodule "dependencies/IsaacLab"]
 	path = dependencies/IsaacLab
 	url = https://github.com/isaac-sim/IsaacLab.git
+[submodule "dependencies/habitat-lab"]
+	path = dependencies/habitat-lab
+	url = https://github.com/facebookresearch/habitat-lab/

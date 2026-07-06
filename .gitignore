@@ -1,1 +1,6 @@
 outputs
+# pixi environments (rebuilt from pixi.lock via `pixi install`)
+.pixi/
+data_collection/
+replica_v1/
+
