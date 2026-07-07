@@ -39,8 +39,25 @@ flips the habitat-sim-mutex to the bullet-enabled build, exactly like
 **habitat-lab.** Installed editable from the submodule, pinned at tag v0.3.3 to
 match habitat-sim 0.3.3.
 
+## submodules
+
+`habitat-lab` is an editable pypi dependency pointing at the
+`dependencies/habitat-lab` submodule, so the checkout has to exist before pixi
+can solve the environment. Two default-env tasks handle it:
+
+```bash
+pixi run --frozen sync-submodules   # bootstrap on a fresh clone (--frozen skips the solve)
+pixi run sync-submodules            # afterwards
+pixi run fetch-submodules           # sync + fetch --all --tags --prune in each submodule
+```
+
+Without `--frozen` on a fresh clone pixi fails with `error while
+canonicalization .../dependencies/habitat-lab/habitat-lab` — it eagerly solves
+the habitat env before running any task.
+
 ## isaaclab
 
-The `isaaclab` stack still lives in the Docker flow (see `Makefile` /
-`Dockerfile`); a second `[feature.isaaclab]` can be added to `pixi.toml` later
-without disturbing the habitat env.
+Removed. The IsaacLab submodule and the Docker flow (`Makefile`, `Dockerfile`)
+that hosted the Isaac Sim stack are gone; habitat is the only simulator here. A
+`[feature.isaaclab]` could still be added to `pixi.toml` later without
+disturbing the habitat env.

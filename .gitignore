@@ -1,6 +1,36 @@
+# --- project data / envs ---
 outputs
 # pixi environments (rebuilt from pixi.lock via `pixi install`)
 .pixi/
 data_collection/
+data/
 replica_v1/
 
+# --- python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.Python
+
+# --- tooling caches ---
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- editor / os ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- agent scratch ---
+.agents/
+.qwen/

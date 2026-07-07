@@ -1,0 +1,88 @@
+# =============================================================================
+# Environment configuration for scripts/load.py
+#
+# This file is the single place to tune the *environment conditions* the agent
+# operates in. The goal of the assignment is not only to implement an algorithm,
+# but to make it robust to the messy conditions below. Change values here and
+# re-run; no code edits required.
+# =============================================================================
+
+# Optional RNG seed. Set an integer for reproducible sensor noise / dropout,
+# or leave null for a fresh draw every run.
+seed: null
+
+scene:
+  # Any mesh habitat-sim can load (.glb, .gltf, .obj, .ply).
+  path: "replica_v1/apartment_0/habitat/mesh_semantic.ply"
+
+agent:
+  # Agent spawn position in world space [x, y, z].
+  start_position: [0.0, 0.0, 0.0]
+  # Per-key actuation amounts. Translations in meters, rotations in degrees.
+  move_forward: 0.25
+  move_backward: 0.25
+  turn_left: 10.0
+  turn_right: 10.0
+
+camera:
+  # ---- Intrinsics -------------------------------------------------------------
+  width: 512          # image width  (px)
+  height: 512         # image height (px)
+  hfov: 90.0          # horizontal field of view (deg) -> defines fx, fy, cx, cy
+  # ---- Extrinsics (sensor pose relative to the agent body) --------------------
+  position: [0.0, 1.5, 0.0]      # sensor offset [x, y(height), z] in meters
+  orientation: [0.0, 0.0, 0.0]   # [pitch, yaw, roll] in RADIANS (camera angle)
+
+birdseye:
+  # Top-down "bird's-eye" navigation viewport, shown in the pygame window as a
+  # second panel beside the first-person RGB. It has its own intrinsics and
+  # extrinsics (independent of `camera`) and follows the agent from above.
+  # Preview only — not written to disk.
+  width: 512                        # image width  (px)
+  height: 512                       # image height (px)
+  hfov: 90.0                        # horizontal field of view (deg)
+  position: [0.0, 2.5, 0.0]         # offset above the agent [x, y(height), z] (m)
+  orientation: [-1.5708, 0.0, 0.0]  # [pitch, yaw, roll] rad; -pi/2 pitch looks straight down
+
+marker:
+  # A box spawned in the world at the agent's start_position (agent.start_position
+  # above). Being a real 3D object, the same landmark appears in BOTH the
+  # first-person and the bird's-eye views, which makes it easy to correlate the
+  # two viewpoints. Enabling this turns on habitat physics automatically.
+  enabled: false
+  size: [0.4, 0.05, 0.4]   # box extents [x, y(thickness), z] in meters
+  height_offset: 0.03      # lift above the floor (m) to avoid z-fighting
+  forward_offset: 1.0      # place marker this far in front of the agent (-Z, m)
+                           # so it sits inside the first-person FOV, not under
+                           # the camera. 0 = exactly at start_position (feet).
+
+lighting:
+  # Photometric model applied to the RGB frame to emulate lighting conditions
+  # (exposure, ambient colour, dynamic range). Neutral defaults = no change.
+  brightness: 1.0                # multiplicative gain (>1 brighter, <1 darker)
+  contrast: 1.0                  # 1.0 = unchanged; pivots around mid-grey
+  gamma: 1.0                     # >1 lifts shadows, <1 crushes them
+  ambient_rgb: [1.0, 1.0, 1.0]   # per-channel tint / colour temperature
+
+depth:
+  # Emulated depth-sensor faults. All-zero / defaults = a perfect sensor.
+  enabled: true
+  stuck: false          # true = sensor is dead, returns all zeros
+  noise_std: 0.0        # additive Gaussian noise std (meters)
+  dropout_prob: 0.0     # fraction of pixels randomly dropped to 0 (0..1)
+  min_range: 0.0        # readings below this become 0 (out of range)
+  max_range: 10.0       # readings above this become 0 (out of range)
+  quantization: 0.0     # round depth to this step (meters); 0 disables
+
+display:
+  # pygame preview window. Enabled panels are shown side-by-side.
+  scale: 1.0            # window scale factor
+  show_rgb: true        # first-person RGB viewport
+  show_birdseye: true   # top-down bird's-eye viewport (see `birdseye` block)
+
+output:
+  root: "data_collection/first_floor/"
+  save_rgb: true
+  save_depth: true
+  save_semantic: true
+  clear_existing: true  # WARNING: wipes `root` on startup when true

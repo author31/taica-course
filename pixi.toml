@@ -6,6 +6,17 @@ version = "0.1.0"
 channels = ["conda-forge", "aihabitat"]
 platforms = ["linux-64"]
 
+# Environment-independent tasks (default env, no habitat deps needed).
+# `sync-submodules` must run *before* `pixi install -e habitat`, because the
+# habitat-lab pypi dependency is an editable install from dependencies/habitat-lab.
+# On a *fresh* clone that directory is still empty, which makes pixi's eager
+# solve of the habitat env fail before any task can start -- so bootstrap with
+#     pixi run --frozen sync-submodules
+# (`--frozen` skips the solve). Afterwards plain `pixi run sync-submodules` works.
+[tasks]
+sync-submodules = { cmd = "git submodule sync --recursive && git submodule update --init --recursive" }
+fetch-submodules = { cmd = "git submodule foreach --recursive 'git fetch --all --tags --prune'", depends-on = ["sync-submodules"] }
+
 [feature.habitat.dependencies]
 python = "3.9.*"
 cmake = "3.27.*"
@@ -13,6 +24,8 @@ numpy = "1.26.4.*"
 habitat-sim = { version = "0.3.3.*", channel = "aihabitat" }
 withbullet = { version = "*", channel = "aihabitat" }
 gdown = "*"
+pygame = "*"
+pyyaml = "*"
 
 [feature.habitat.pypi-dependencies]
 habitat-lab = { path = "dependencies/habitat-lab/habitat-lab", editable = true }
