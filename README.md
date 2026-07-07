@@ -1,139 +1,123 @@
-# TAICA Course — HW1: Camera Pose Estimation in IsaacLab
+# TAICA Course — HW1: Camera Pose Estimation in Habitat-Sim
 
-A two-stage pipeline built on [IsaacLab](https://github.com/isaac-sim/IsaacLab):
+A two-stage pipeline built on [Habitat-Sim](https://github.com/facebookresearch/habitat-sim)
+and the [Replica](https://github.com/facebookresearch/Replica-Dataset) `apartment_0` scene:
 
-1. **`scripts/hw1.py`** — drive a Jetbot around a warehouse scene inside Isaac Sim,
-   capture RGB-D keyframes (with ground-truth camera poses), and save them to disk.
-2. **`scripts/reconstruct.py`** — offline, simulator-free geometric reconstruction
-   (depth unprojection → FPFH/RANSAC → ICP) that rebuilds a world map and compares
-   the *estimated* camera trajectory against the ground truth.
+1. **`scripts/load.py`** — interactively drive an agent through the scene in a
+   pygame window, previewing a first-person and a bird's-eye view, and capture
+   RGB / depth / semantic keyframes (with ground-truth camera poses) to disk.
+2. **`scripts/reconstruct.py`** — offline, simulator-free geometric
+   reconstruction (depth unprojection → FPFH/RANSAC → ICP) that rebuilds a
+   world map and scores the *estimated* camera trajectory against the ground truth.
 
----
-
-## 1. Launch the IsaacLab workspace
-
-The simulator runs inside a Docker image. The first invocation builds the image
-(submodules must be initialized first); subsequent runs reuse it.
-
-```bash
-# One-time: pull the IsaacLab submodule
-make submodules
-
-# Build (if needed) and launch the container with GPU + X11 display
-make launch-isaaclab
-```
-
-`make launch-isaaclab`:
-
-- builds the `leisaac-isaaclab:latest` image (depends on `build-isaaclab`),
-- enables local X11 access (`xhost +local:root`, reverted on exit),
-- runs the container on GPU `device=0` with host networking, the repo
-  bind-mounted at `/workspace/aicapstone`, and the display forwarded,
-- selects the NVIDIA Vulkan ICD, verifies the required GL/X/Vulkan libs, then
-  drops you into an interactive `bash` shell at `/workspace/aicapstone`.
-
-Useful overrides:
-
-```bash
-make launch-isaaclab IMAGE=my-image:tag GPU=all CONTAINER_NAME=isaaclab
-make check-isaaclab-gpu     # sanity-check GPU / Vulkan / torch CUDA inside the image
-```
-
-All commands below are run **inside** that container shell.
+The whole environment is managed by [pixi](https://pixi.sh); both scripts run in
+the same `habitat` environment.
 
 ---
 
-## 2. Collect keyframes — `scripts/hw1.py`
+## 1. Environment preparation
 
-Opens the GUI, spawns a Jetbot with a forward-facing RGB-D camera in a warehouse,
-and lets you teleoperate it while capturing keyframes.
-
-```bash
-python scripts/hw1.py
-```
-
-Common options:
+### Install pixi (one-time, if you don't have it)
 
 ```bash
-python scripts/hw1.py \
-    --warehouse_usd Environments/Simple_Warehouse/warehouse.usd \
-    --robot_usd Isaac/Robots/Turtlebot/turtlebot3_burger.usd \
-    --out outputs/hw1 \
-    --width 640 --height 480 \
-    --capture_every 0          # >0 = auto-capture every N control steps while moving
+curl -fsSL https://pixi.sh/install.sh | bash
+# then restart the shell (or `source ~/.bashrc`) so `pixi` is on PATH
 ```
 
-(`--assets_root` defaults to the Isaac nucleus assets dir. Standard IsaacLab
-`AppLauncher` flags such as `--headless` and `--device` are also accepted.)
+### Install the project environment
 
-### Keybindings
+From the repo root — this solves and installs the `habitat` environment
+(Python 3.9, habitat-sim 0.3.3 + bullet, habitat-lab, pygame, open3d, …) from
+`pixi.lock`:
 
-| Key       | Action                                            |
-|-----------|---------------------------------------------------|
-| `W` / `S` | drive forward / backward                          |
-| `A` / `D` | turn left / right                                 |
-| `R`       | capture the current frame as a keyframe           |
-| `C`       | clear the keyframe buffer                         |
-| `F`       | save the keyframe buffer to `<out>/keyframes.npz` |
-| `L`       | reset the robot to its spawn pose                 |
-| `Q` / `ESC` | quit the simulation                             |
+```bash
+pixi install -e habitat
+```
 
-Driving is continuous (velocity is applied while the key is held); `R`/`C`/`F`/`L`
-fire once per press.
+Sanity-check the install:
+
+```bash
+pixi run -e habitat smoke      # prints habitat-sim / habitat-lab versions + bullet build
+```
+
+### Download the Replica scene
+
+`load.py` needs `apartment_0` at the path in `scripts/config.yaml`
+(`replica_v1/apartment_0/…`). Fetch it with the provided task:
+
+```bash
+pixi run -e habitat fetch-replica   # downloads + unzips replica_v1/apartment_0
+```
+
+---
+
+## 2. Collect keyframes — `scripts/load.py`
+
+Opens a pygame window with a first-person RGB view and a top-down bird's-eye
+view side by side, and lets you teleoperate the agent while capturing frames.
+
+```bash
+pixi run -e habitat python scripts/load.py
+# optional explicit config:
+pixi run -e habitat python scripts/load.py --config scripts/config.yaml
+```
+
+All environment conditions (spawn pose, camera intrinsics/extrinsics, bird's-eye
+camera, lighting, depth-sensor faults, output paths) live in
+**`scripts/config.yaml`** — retune there, no code edits.
+
+### Keybindings (the pygame window must have focus)
+
+| Key         | Action                          |
+|-------------|---------------------------------|
+| `W` / `S`   | move forward / backward         |
+| `A` / `D`   | turn left / right               |
+| `C` / `SPACE` | capture the current frame     |
+| `Q` / `ESC` | finish and quit                 |
+
+Movement only refreshes the live preview; **capture is decoupled from movement**,
+so only the frames you explicitly capture are written to disk.
 
 ### Output
 
-Pressing `F` writes **`<out>/keyframes.npz`** (default `outputs/hw1/keyframes.npz`),
-a compressed bundle of per-keyframe stacked arrays:
+Written under `output.root` in `config.yaml` (default `data_collection/first_floor/`):
 
-| Array        | Shape           | Dtype   | Meaning                                      |
-|--------------|-----------------|---------|----------------------------------------------|
-| `rgb`        | `(N, H, W, 3)`  | uint8   | RGB image                                    |
-| `depth`      | `(N, H, W)`     | float32 | metric z-buffer depth (camera frame)         |
-| `intrinsics` | `(N, 3, 3)`     | float32 | pinhole camera intrinsics                    |
-| `pos`        | `(N, 3)`        | float32 | ground-truth camera world position `[x,y,z]` |
-| `quat`       | `(N, 4)`        | float32 | ground-truth orientation `[qw, qx, qy, qz]`  |
+| Path              | Meaning                                                    |
+|-------------------|------------------------------------------------------------|
+| `rgb/<n>.png`     | first-person RGB (lighting applied)                        |
+| `depth/<n>.png`   | depth preview (normalized to `depth.max_range`)            |
+| `semantic/<n>.png`| colourised semantic labels                                 |
+| `GT_pose.npy`     | `(N, 7)` captured poses `[x, y, z, qw, qx, qy, qz]`        |
 
-Captures are also echoed to the console (`[HW1] captured keyframe #k ...`).
+> To collect a second-floor set, point `output.root` at
+> `data_collection/second_floor/` in `config.yaml` and re-run.
 
 ---
 
 ## 3. Reconstruct & evaluate — `scripts/reconstruct.py`
 
-Runs entirely on numpy + Open3D + scipy + matplotlib — **no IsaacLab/Omniverse
-dependency** — so it can run outside the simulator. It unprojects each keyframe's
-depth into a point cloud, chains pairwise RANSAC + ICP registration to estimate
-the camera trajectory, accumulates a world map, and scores the estimate against
+Runs on numpy + Open3D + scipy — no simulator needed. It unprojects each
+keyframe's depth into a point cloud, chains pairwise RANSAC + ICP registration to
+estimate the trajectory, accumulates a world map, and scores the estimate against
 the stored ground-truth poses.
 
 ```bash
-python scripts/reconstruct.py outputs/hw1/keyframes.npz
+pixi run -e habitat python scripts/reconstruct.py             # floor 1, Open3D ICP
 ```
 
-Common options:
+Options:
 
 ```bash
-python scripts/reconstruct.py keyframes.npz \
-    --voxel 0.05 \          # reconstruction voxel size [m]
-    --max_depth 8.0 \       # drop depth beyond this [m]
-    -o outputs/hw1          # output dir (defaults to the npz's directory)
-
-python scripts/reconstruct.py outputs/hw1/keyframes.npz --show     # interactive 3D window
-python scripts/reconstruct.py outputs/hw1/keyframes.npz --no-show  # render PNG only
+pixi run -e habitat python scripts/reconstruct.py \
+    -f 1 \            # floor: 1 -> data_collection/first_floor, 2 -> second_floor
+    -v open3d         # ICP backend: open3d (required) or my_icp (custom, bonus)
 ```
 
-(`--show` defaults to on when `$DISPLAY` is set, off otherwise.)
+`-f`/`--floor` selects the input directory; it must contain the `rgb/`, `depth/`,
+and `GT_pose.npy` produced by step 2. At least 2 keyframes are required.
 
 ### Output
 
-Written to `<out>` (default: the npz's directory):
-
-| File                  | Description                                                          |
-|-----------------------|---------------------------------------------------------------------|
-| `reconstruction.ply`  | accumulated world point cloud                                       |
-| `trajectory.png`      | 3D plot: ground-truth (black) vs estimated (red) camera poses       |
-| `trajectory_eval.npy` | per-frame GT/estimated positions + per-frame translation error      |
-| `reconstruction.png`  | 3D Open3D render of the map overlaid with both trajectories         |
-
-The console also prints a per-frame GT-vs-estimated table and the **mean
-translation error vs ground truth**. (At least 2 keyframes are required.)
+The console prints per-frame progress and the **mean L2 trajectory error vs
+ground truth**, then opens an Open3D window showing the reconstructed point cloud
+with the estimated (red) and ground-truth (black) camera trajectories.

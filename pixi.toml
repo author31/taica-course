@@ -13,6 +13,8 @@ numpy = "1.26.4.*"
 habitat-sim = { version = "0.3.3.*", channel = "aihabitat" }
 withbullet = { version = "*", channel = "aihabitat" }
 gdown = "*"
+pygame = "*"
+pyyaml = "*"
 
 [feature.habitat.pypi-dependencies]
 habitat-lab = { path = "dependencies/habitat-lab/habitat-lab", editable = true }
