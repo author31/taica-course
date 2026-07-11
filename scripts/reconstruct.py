@@ -7,6 +7,7 @@ import open3d as o3d
 import argparse
 from copy import deepcopy
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial import cKDTree
 import time
 
 # ---------- Camera Intrinsics (Resolution 512x512, FOV 90) ----------
@@ -240,8 +241,138 @@ def remove_ceiling(pcd, ratio=0.1):
     return pcd.select_by_index(np.where(keep)[0])
 
 
+# =============================================================================
+# Robust SLAM back-end (default reconstruction)
+#
+# The naive chain above (global RANSAC + ICP, frame-to-frame, no loop closure)
+# is drift-unbounded and — worse — fragile: on rotationally symmetric geometry
+# FPFH feature-matching happily returns a spurious ~180deg alignment with
+# fitness 1.0, and that single bad pair derails the entire trajectory. The SLAM
+# path below fixes both failure modes:
+#
+#   * COLORED ICP front-end. registration_colored_icp uses RGB as well as
+#     geometry, so texture disambiguates the geometric symmetry that traps
+#     geometry-only ICP. Consecutive dense frames move little, so a
+#     constant-velocity prior (NOT RANSAC) initializes each step; a physical
+#     gate rejects any pair claiming an implausibly large motion.
+#   * POSE-GRAPH back-end. Odometry edges plus loop-closure edges (temporally
+#     far, spatially near revisits, coarse FPFH-RANSAC init then colored-ICP
+#     refine) are globally optimized with a robust line process, which bounds
+#     drift and auto-rejects bad loop edges.
+# =============================================================================
+_SLAM_VOXELS = (0.10, 0.05)     # coarse -> fine colored-ICP scales (meters)
+_MAX_STEP_T = 0.5               # physical gate: max plausible inter-frame translation (m)
+_MAX_STEP_R = 20.0              # physical gate: max plausible inter-frame rotation (deg)
+
+
+def _multiscale(pcd, voxels=_SLAM_VOXELS):
+    """Downsample a cloud at several voxel sizes, each with normals (needed by
+    colored ICP / point-to-plane)."""
+    out = []
+    for v in voxels:
+        d = pcd.voxel_down_sample(v)
+        d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=v * 2, max_nn=30))
+        out.append(d)
+    return out
+
+
+def _rot_deg(T):
+    return float(np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1.0, 1.0))))
+
+
+def _colored_icp(src_ms, tgt_ms, init, voxels=_SLAM_VOXELS):
+    """Coarse-to-fine colored ICP. Returns (transform, fitness)."""
+    T, res = init, None
+    for k, v in enumerate(voxels):
+        try:
+            res = o3d.pipelines.registration.registration_colored_icp(
+                src_ms[k], tgt_ms[k], v * 1.4, T,
+                o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(
+                    relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=40))
+            T = res.transformation
+        except Exception:
+            return T, 0.0
+    return T, (res.fitness if res is not None else 0.0)
+
+
+def _plausible(T):
+    return np.linalg.norm(T[:3, 3]) < _MAX_STEP_T and _rot_deg(T) < _MAX_STEP_R
+
+
+def _odometry(ms, pose0):
+    """Sequential colored-ICP odometry with a constant-velocity prior + gate."""
+    poses = [pose0.copy()]
+    rels = [np.eye(4)]
+    prev = np.eye(4)
+    gated = 0
+    for i in range(1, len(ms)):
+        T, fit = _colored_icp(ms[i], ms[i - 1], prev)          # constant-velocity init
+        if not (fit > 0.5 and _plausible(T)):
+            T2, fit2 = _colored_icp(ms[i], ms[i - 1], np.eye(4))  # retry from identity
+            if fit2 > 0.5 and _plausible(T2):
+                T = T2
+            else:
+                T, gated = prev, gated + 1                       # trust the motion prior
+        poses.append(poses[i - 1] @ T)
+        rels.append(T)
+        prev = T
+    return poses, rels, gated
+
+
+def slam_poses(ms, pose0, coarse_voxel=0.10):
+    """Colored-ICP odometry + pose-graph loop closure + global optimization.
+    Returns a list of camera->world poses anchored so poses[0] == pose0."""
+    reg = o3d.pipelines.registration
+    n = len(ms)
+    poses, rels, gated = _odometry(ms, pose0)
+    print(f"odometry: {n} frames, {gated} gated to motion prior")
+    maxd = _SLAM_VOXELS[-1] * 1.4
+
+    pg = reg.PoseGraph()
+    for p in poses:
+        pg.nodes.append(reg.PoseGraphNode(p.copy()))
+    for i in range(1, n):     # odometry edges: source=i, target=i-1, T maps i -> i-1
+        info = reg.get_information_matrix_from_point_clouds(ms[i][1], ms[i - 1][1], maxd, rels[i])
+        pg.edges.append(reg.PoseGraphEdge(i, i - 1, rels[i], info, uncertain=False))
+
+    # Loop closures: temporally far, spatially near per odometry. A KD-tree
+    # over odometry positions keeps candidate search O(n log n); Fast Global
+    # Registration on FPFH gives a cheap wide-baseline init (no 100k-iter
+    # RANSAC), and colored ICP refines it. Candidates are subsampled and the
+    # closest temporally-far neighbor per source frame is kept.
+    coarse = [preprocess_point_cloud(ms[i][1], coarse_voxel) for i in range(n)]
+    pos = np.array([p[:3, 3] for p in poses])
+    tree = cKDTree(pos)
+    src_step = max(1, n // 250)          # cap the number of loop probes
+    fgr_opt = reg.FastGlobalRegistrationOption(
+        maximum_correspondence_distance=coarse_voxel * 1.5)
+    loops = 0
+    for a in range(0, n, src_step):
+        far = [b for b in tree.query_ball_point(pos[a], 1.5) if b >= a + 25]
+        if not far:
+            continue
+        b = min(far, key=lambda j: np.linalg.norm(pos[a] - pos[j]))   # closest revisit
+        fgr = reg.registration_fgr_based_on_feature_matching(
+            coarse[b][0], coarse[a][0], coarse[b][1], coarse[a][1], fgr_opt)  # b -> a
+        T, fit = _colored_icp(ms[b], ms[a], fgr.transformation)
+        if fit > 0.6:
+            info = reg.get_information_matrix_from_point_clouds(ms[b][1], ms[a][1], maxd, T)
+            if info[0, 0] / max(len(ms[b][1].points), 1) > 0.3:      # enough overlap
+                pg.edges.append(reg.PoseGraphEdge(b, a, T, info, uncertain=True))
+                loops += 1
+    print(f"pose graph: {n - 1} odometry edges, {loops} loop-closure edges")
+
+    reg.global_optimization(
+        pg, reg.GlobalOptimizationLevenbergMarquardt(),
+        reg.GlobalOptimizationConvergenceCriteria(),
+        reg.GlobalOptimizationOption(max_correspondence_distance=maxd,
+                                     edge_prune_threshold=0.25,
+                                     preference_loop_closure=2.0, reference_node=0))
+    return [np.asarray(node.pose) for node in pg.nodes]
+
+
 def reconstruct(args):
-    voxel_size = 0.25
     rgb_dir = os.path.join(args.data_root, "rgb")
     depth_dir = os.path.join(args.data_root, "depth")
 
@@ -263,53 +394,27 @@ def reconstruct(args):
 
     # Anchor the estimated trajectory to the GT start pose so both live in the
     # same world frame (reconstruction is only recoverable up to that pose).
-    if len(gt_poses) > 0:
-        camera_poses = [gt_poses[0].copy()]
-    else:
-        camera_poses = [np.eye(4)]
+    pose0 = gt_poses[0].copy() if len(gt_poses) > 0 else np.eye(4)
 
-    # Per-frame full-resolution clouds (kept for accumulation into the map).
-    frames = []
+    # Per-frame multiscale clouds. We keep only the downsampled scales (the fine
+    # scale doubles as the map source) so memory stays bounded over long runs.
+    ms_list = []
     for rgb_path, depth_path in zip(rgb_files, depth_files):
         rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)[:, :, ::-1]   # BGR -> RGB
         depth_m = load_depth_meters(depth_path)
-        frames.append(depth_image_to_point_cloud(rgb, depth_m))
+        ms_list.append(_multiscale(depth_image_to_point_cloud(rgb, depth_m)))
 
-    if not frames:
+    if not ms_list:
         print(f"no frames under {rgb_dir}")
-        return o3d.geometry.PointCloud(), camera_poses, gt_poses
+        return o3d.geometry.PointCloud(), [pose0], gt_poses
 
-    accumulated_pcd = deepcopy(frames[0]).transform(camera_poses[0])
-    prev_down, prev_fpfh = preprocess_point_cloud(frames[0], voxel_size)
+    # Estimate the trajectory with robust SLAM, then fuse the map.
+    camera_poses = slam_poses(ms_list, pose0)
 
-    # Reconstruction Loop [cite: 29-30]
-    for i in range(1, len(frames)):
-        print(f"Processing Frame {i}...")
-        # 1. (already unprojected)  2. Preprocess (voxel / normals / FPFH).
-        src_down, src_fpfh = preprocess_point_cloud(frames[i], voxel_size)
-
-        # 3. Global registration (RANSAC) for a coarse init.
-        ransac = global_registration(
-            src_down, src_fpfh, prev_down, prev_fpfh, voxel_size)
-
-        # 4. Local registration (ICP) refines source(i) -> target(i-1).
-        icp_thresh = voxel_size * 0.4
-        if args.version == "my_icp":
-            icp = my_local_icp_algorithm(
-                src_down, prev_down, ransac.transformation, icp_thresh)
-        else:
-            icp = local_icp_algorithm(
-                src_down, prev_down, ransac.transformation, icp_thresh)
-
-        # 5. Chain to a global pose, accumulate the transformed cloud.
-        global_pose = camera_poses[i - 1] @ icp.transformation
-        camera_poses.append(global_pose)
-        accumulated_pcd += deepcopy(frames[i]).transform(global_pose)
-
-        prev_down, prev_fpfh = src_down, src_fpfh
-
-    # Keep the map manageable, then drop the ceiling [cite: 37].
-    accumulated_pcd = accumulated_pcd.voxel_down_sample(voxel_size * 0.5)
+    accumulated_pcd = o3d.geometry.PointCloud()
+    for ms, pose in zip(ms_list, camera_poses):
+        accumulated_pcd += deepcopy(ms[1]).transform(pose)      # fine scale (voxel 0.05)
+    accumulated_pcd = accumulated_pcd.voxel_down_sample(0.05)
     accumulated_pcd = remove_ceiling(accumulated_pcd)
 
     return accumulated_pcd, camera_poses, gt_poses

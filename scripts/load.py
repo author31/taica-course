@@ -21,19 +21,40 @@ WHAT THIS IS
     top-to-bottom in a single pass. Prefer clarity over cleverness when editing.
 
 HOW TO RUN
-    pixi run -e habitat python scripts/load.py [--config scripts/config.yaml]
+    Interactive (pygame window, drive with the keyboard):
+        pixi run -e habitat python scripts/load.py [--config scripts/config.yaml]
+
+    Automated replay (drives a precomputed trajectory in the SAME pygame window,
+    capturing every frame through the SAME config pipeline, so lighting / depth
+    faults still apply):
+        pixi run -e habitat python scripts/load.py --trajectory best_trajectory.npy
+        # optional: --fps 15 to slow the preview; q / ESC aborts mid-replay
 
     Requires the pixi `habitat` environment (Python 3.9, habitat-sim 0.3.3,
     pygame, pyyaml) and the Replica scene at the path in config.yaml
     (`pixi run fetch-replica` downloads apartment_0).
 
-KEYBINDINGS  (the pygame window must have focus)
+KEYBINDINGS  (interactive mode only; the pygame window must have focus)
     w  move forward       a  turn left        c / SPACE  capture frame
     s  move backward      d  turn right       q / ESC    quit
 
     Movement only refreshes the live preview. Capture is DECOUPLED from
     movement: only captured frames are written to disk, so the student chooses
     the trajectory that gets recorded.
+
+TRAJECTORY REPLAY  (--trajectory, optional)
+    Accepts either artefact produced by scripts/search_traj.py:
+      *.npy  : (N,7) sensor poses [x,y,z, qw,qx,qy,qz] (e.g. best_trajectory.npy).
+               The agent is teleported so the camera matches each pose and a
+               frame is captured — an EXACT replay, independent of config
+               actuation amounts. This is the robust/default choice.
+      *.json : the .actions.json sidecar; replayed by STEPPING its discrete
+               actions from agent.start_position. This reproduces the path only
+               if config.yaml's actuation (move_forward / turn_*) matches the
+               values that generated it.
+    Replay renders each frame in the pygame preview window (first-person RGB +
+    bird's-eye, same as interactive) and writes the usual DATA OUTPUTS below.
+    `--fps` paces the preview; q / ESC aborts.
 
 CONFIGURATION  (scripts/config.yaml — the whole point of the assignment)
     scene     : mesh path.
@@ -70,7 +91,11 @@ CODE MAP
     process_observations     apply the config to raw observations ONCE, so the
                              preview matches exactly what gets saved.
     build_canvas/draw        compose enabled panels and blit them to pygame.
-    main                     dirs -> simulator -> pygame window -> event loop.
+    save_frame               write one capture (rgb/depth/semantic) + return its
+                             GT pose row; shared by interactive + replay.
+    load_trajectory / replay_poses / replay_actions / run_replay
+                             headless replay of a --trajectory file.
+    main                     dirs -> simulator -> (replay | pygame event loop).
 
 DATA OUTPUTS  (under output.root, e.g. data_collection/first_floor/)
     rgb/<n>.png  depth/<n>.png  semantic/<n>.png   one set per capture.
@@ -90,6 +115,7 @@ CRITICAL GOTCHA — DO NOT REMOVE THE GL WORKAROUNDS
 """
 
 import os
+import json
 import argparse
 import shutil
 
@@ -108,9 +134,11 @@ import cv2
 import pygame
 from PIL import Image
 
+from scipy.spatial.transform import Rotation as Rot
+
 import magnum as mn
 import habitat_sim
-from habitat_sim.utils.common import d3_40_colors_rgb
+from habitat_sim.utils.common import d3_40_colors_rgb, quat_from_coeffs
 
 
 # =============================================================================
@@ -333,12 +361,137 @@ def draw(screen, frame, display_cfg, count, font):
 
 
 # =============================================================================
+# Capture I/O (shared by interactive capture and headless replay)
+# =============================================================================
+def save_frame(frame, sensor_state, data_root, out, idx):
+    """Write one capture's rgb/depth/semantic PNGs and return its GT pose row
+    [x, y, z, qw, qx, qy, qz] from the color-sensor world pose."""
+    if out["save_rgb"]:
+        cv2.imwrite(os.path.join(data_root, "rgb", f"{idx}.png"),
+                    frame["rgb"][:, :, ::-1])              # RGB -> BGR for cv2
+    if out["save_depth"]:
+        cv2.imwrite(os.path.join(data_root, "depth", f"{idx}.png"), frame["depth_vis"])
+    if out["save_semantic"]:
+        cv2.imwrite(os.path.join(data_root, "semantic", f"{idx}.png"),
+                    frame["semantic"][:, :, ::-1])
+    p, r = sensor_state.position, sensor_state.rotation
+    return [p[0], p[1], p[2], r.w, r.x, r.y, r.z]
+
+
+# =============================================================================
+# Trajectory replay (headless): drive a precomputed path and capture every frame
+# =============================================================================
+def load_trajectory(path):
+    """Return (kind, data): ('poses', (N,7) array) for a .npy, or
+    ('actions', [str, ...]) for a search_traj .actions.json sidecar."""
+    if path.endswith(".npy"):
+        return "poses", np.load(path)
+    if path.endswith(".json"):
+        with open(path, "r") as f:
+            meta = json.load(f)
+        actions = meta.get("actions")
+        if not actions:
+            raise ValueError(f"{path} has no 'actions' list to replay")
+        return "actions", actions
+    raise ValueError(f"unsupported trajectory file (want .npy or .json): {path}")
+
+
+def agent_state_from_sensor_pose(pose, config):
+    """Build an AgentState that puts the COLOR sensor at world pose `pose`
+    ([x,y,z, qw,qx,qy,qz]). Inverts the fixed camera extrinsic (config.camera
+    position + orientation) so the teleported sensor matches the pose exactly."""
+    cam = config["camera"]
+    sensor_R = Rot.from_quat([pose[4], pose[5], pose[6], pose[3]])   # x,y,z,w
+    cam_R = Rot.from_euler("xyz", [float(v) for v in cam["orientation"]])
+    t_cam = np.asarray(cam["position"], dtype=np.float64)
+
+    # world_sensor = agent ∘ extrinsic  =>  agent_R = sensor_R · cam_R⁻¹,
+    # agent_pos = sensor_pos − agent_R · t_cam.
+    agent_R = sensor_R * cam_R.inv()
+    agent_pos = np.asarray(pose[:3], dtype=np.float64) - agent_R.apply(t_cam)
+
+    st = habitat_sim.AgentState()
+    st.position = agent_pos.astype(np.float32)
+    st.rotation = quat_from_coeffs(agent_R.as_quat().astype(np.float32))   # [x,y,z,w]
+    return st
+
+
+def replay_poses(sim, agent, config, poses, data_root, out, render=None):
+    """Teleport the camera to each pose, capture a frame. Exact replay. If a
+    `render(frame, idx)` callback is given it is called per frame; returning
+    False from it aborts the replay early."""
+    cam_extr = []
+    for i, pose in enumerate(poses, start=1):
+        agent.set_state(agent_state_from_sensor_pose(pose, config))
+        obs = sim.get_sensor_observations()
+        frame = process_observations(obs, config)
+        sensor_state = agent.get_state().sensor_states["color_sensor"]
+        cam_extr.append(save_frame(frame, sensor_state, data_root, out, i))
+        if i % 25 == 0 or i == len(poses):
+            print(f"replay: captured {i}/{len(poses)} frames")
+        if render is not None and not render(frame, i):
+            print(f"replay: aborted by user at frame {i}")
+            break
+    return cam_extr
+
+
+def replay_actions(sim, agent, config, actions, data_root, out, render=None):
+    """Step the discrete actions from start_position, capturing a frame before
+    the first action and after each one (matches search_traj's stride-1 capture).
+    An optional `render(frame, idx)` callback previews each frame; returning
+    False aborts."""
+    state = habitat_sim.AgentState()
+    state.position = np.array(config["agent"]["start_position"], dtype=np.float32)
+    agent.set_state(state)
+
+    cam_extr = []
+    total = len(actions) + 1
+
+    def grab(idx):
+        obs = sim.get_sensor_observations()
+        frame = process_observations(obs, config)
+        sensor_state = agent.get_state().sensor_states["color_sensor"]
+        cam_extr.append(save_frame(frame, sensor_state, data_root, out, idx))
+        if idx % 25 == 0 or idx == total:
+            print(f"replay: captured {idx}/{total} frames")
+        return frame
+
+    frame = grab(1)
+    if render is not None and not render(frame, 1):
+        return cam_extr
+    for i, action in enumerate(actions, start=2):
+        sim.step(action)
+        frame = grab(i)
+        if render is not None and not render(frame, i):
+            print(f"replay: aborted by user at frame {i}")
+            break
+    return cam_extr
+
+
+def run_replay(sim, agent, config, traj_path, data_root, out, render=None):
+    kind, data = load_trajectory(traj_path)
+    print(f"replay: driving {kind} trajectory from {traj_path}")
+    if kind == "poses":
+        cam_extr = replay_poses(sim, agent, config, data, data_root, out, render)
+    else:
+        cam_extr = replay_actions(sim, agent, config, data, data_root, out, render)
+    np.save(os.path.join(data_root, "GT_pose.npy"), np.asarray(cam_extr, dtype=np.float32))
+    print(f"replay: saved {len(cam_extr)} frames + GT_pose.npy to {data_root}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     default_config = os.path.join(os.path.dirname(__file__), "config.yaml")
     parser.add_argument("--config", default=default_config, help="Path to YAML config")
+    parser.add_argument("--trajectory", default=None,
+                        help="optional path to a trajectory to replay in the "
+                             "pygame window (.npy of (N,7) poses, or a search_traj "
+                             ".actions.json); omit for interactive keyboard collection")
+    parser.add_argument("--fps", type=float, default=30.0,
+                        help="replay preview frame rate (0 = as fast as possible)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -377,7 +530,46 @@ def main():
 
     print("Discrete action space:", list(sim.config.agents[0].action_space.keys()))
 
-    # --- keybindings ---
+    # --- pygame window (shared by interactive collection and replay preview) ---
+    # Render one frame up front so the window can be sized to the real canvas
+    # (RGB + bird's-eye panels). Read the sensors WITHOUT stepping so the first
+    # preview is the true start_position.
+    pygame.init()
+    font = pygame.font.SysFont(None, 28)
+    obs = sim.get_sensor_observations()
+    frame = process_observations(obs, config)
+    sensor_state = agent.get_state().sensor_states["color_sensor"]
+    canvas = build_canvas(frame, config["display"])
+    scale = float(config["display"]["scale"])
+    screen = pygame.display.set_mode(
+        (int(canvas.shape[1] * scale), int(canvas.shape[0] * scale)))
+    pygame.display.set_caption("Habitat data collector")
+
+    def render(frame, count):
+        draw(screen, frame, config["display"], count, font)
+
+    # --- trajectory replay mode: drive the path, PREVIEW each frame, capture ---
+    if args.trajectory:
+        delay_ms = int(1000.0 / args.fps) if args.fps and args.fps > 0 else 0
+
+        def on_frame(frame, count):
+            render(frame, count)
+            for event in pygame.event.get():          # let the user abort mid-replay
+                if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN
+                        and event.key in (pygame.K_q, pygame.K_ESCAPE)):
+                    return False
+            if delay_ms:
+                pygame.time.wait(delay_ms)
+            return True
+
+        print("replaying trajectory — q / ESC to abort")
+        run_replay(sim, agent, config, args.trajectory, data_root, out, on_frame)
+        pygame.quit()
+        sim.close()
+        return
+
+    # --- interactive keybindings ---
     KEY_ACTION = {
         pygame.K_w: "move_forward",
         pygame.K_s: "move_backward",
@@ -395,57 +587,29 @@ def main():
     print("  q or ESC   : finish and quit")
     print("#############################")
 
-    # --- pygame window ---
-    pygame.init()
-    font = pygame.font.SysFont(None, 28)
-
     cam_extr = []   # captured GT poses [x, y, z, qw, qx, qy, qz]
     count = 0
-
-    # Render one frame up front so the window can be sized to the real canvas
-    # (RGB + bird's-eye panels), then keep it as the first preview. Read the
-    # sensors WITHOUT stepping so the first preview is the true start_position
-    # (sim.step would silently advance the agent before the student touches a key).
-    obs = sim.get_sensor_observations()
-    frame = process_observations(obs, config)
-    sensor_state = agent.get_state().sensor_states["color_sensor"]
-    canvas = build_canvas(frame, config["display"])
-    scale = float(config["display"]["scale"])
-    screen = pygame.display.set_mode(
-        (int(canvas.shape[1] * scale), int(canvas.shape[0] * scale)))
-    pygame.display.set_caption("Habitat data collector")
-
-    def render(frame):
-        draw(screen, frame, config["display"], count, font)
 
     def step_and_render(action):
         """Step the sim, refresh the preview, return the processed frame + pose."""
         obs = sim.step(action)
         frame = process_observations(obs, config)
-        render(frame)
+        render(frame, count)
         sensor_state = agent.get_state().sensor_states["color_sensor"]
         return frame, sensor_state
 
     def capture(frame, sensor_state):
         nonlocal count
         count += 1
-        if out["save_rgb"]:
-            cv2.imwrite(os.path.join(data_root, "rgb", f"{count}.png"),
-                        frame["rgb"][:, :, ::-1])  # RGB -> BGR for cv2
-        if out["save_depth"]:
-            cv2.imwrite(os.path.join(data_root, "depth", f"{count}.png"), frame["depth_vis"])
-        if out["save_semantic"]:
-            cv2.imwrite(os.path.join(data_root, "semantic", f"{count}.png"),
-                        frame["semantic"][:, :, ::-1])
-        p, r = sensor_state.position, sensor_state.rotation
-        cam_extr.append([p[0], p[1], p[2], r.w, r.x, r.y, r.z])
-        render(frame)  # refresh the capture-counter overlay immediately
+        pose = save_frame(frame, sensor_state, data_root, out, count)
+        cam_extr.append(pose)
+        render(frame, count)  # refresh the capture-counter overlay immediately
         print(f"captured frame {count} @ pose "
-              f"({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}) "
-              f"({r.w:.3f}, {r.x:.3f}, {r.y:.3f}, {r.z:.3f})")
+              f"({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}) "
+              f"({pose[3]:.3f}, {pose[4]:.3f}, {pose[5]:.3f}, {pose[6]:.3f})")
 
     # initial preview
-    render(frame)
+    render(frame, count)
 
     running = True
     while running:
