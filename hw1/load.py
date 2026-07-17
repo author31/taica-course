@@ -22,12 +22,13 @@ WHAT THIS IS
 
 HOW TO RUN
     Interactive (pygame window, drive with the keyboard):
-        pixi run -e habitat python scripts/load.py [--config scripts/config.yaml]
+        pixi run -e habitat python hw1/load.py --config scripts/config.yaml
 
     Automated replay (drives a precomputed trajectory in the SAME pygame window,
     capturing every frame through the SAME config pipeline, so lighting / depth
     faults still apply):
-        pixi run -e habitat python scripts/load.py --trajectory best_trajectory.npy
+        pixi run -e habitat python hw1/load.py --config scripts/config.yaml \
+            --trajectory trajectories/firstfloor.npy
         # optional: --fps 15 to slow the preview; q / ESC aborts mid-replay
 
     Requires the pixi `habitat` environment (Python 3.9, habitat-sim 0.3.3,
@@ -44,7 +45,7 @@ KEYBINDINGS  (interactive mode only; the pygame window must have focus)
 
 TRAJECTORY REPLAY  (--trajectory, optional)
     Accepts either artefact produced by scripts/search_traj.py:
-      *.npy  : (N,7) sensor poses [x,y,z, qw,qx,qy,qz] (e.g. best_trajectory.npy).
+      *.npy  : (N,7) sensor poses [x,y,z, qw,qx,qy,qz] (e.g. trajectories/firstfloor.npy).
                The agent is teleported so the camera matches each pose and a
                frame is captured — an EXACT replay, independent of config
                actuation amounts. This is the robust/default choice.

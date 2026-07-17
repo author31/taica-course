@@ -51,10 +51,19 @@ DEPTH_SCALE  = 1000.0
 
 
 def load_depth_meters(depth_path):
-    """Read a depth PNG and return it as float64 metres.
+    """Read a depth PNG from disk and return it as a float64 depth map in metres.
 
-    uint16 → millimetres (/1000); anything else → Habitat 8-bit vis (/255*10).
-    Returns None if the file cannot be read."""
+    SPEC:
+        Read `depth_path` preserving the on-disk bit depth (cv2.IMREAD_UNCHANGED).
+        - If the read fails, return None.
+        - If the image has 3 channels, collapse to the first channel.
+        - Auto-detect the encoding by dtype and convert to METRES:
+            * uint16  -> millimetres:      value / DEPTH_SCALE (1000.0).
+            * anything else (uint8 vis) -> Habitat 8-bit vis: value / 255.0 * 10.0.
+        Return a float64 H*W array (or None on read failure).
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    """
     d = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if d is None:
         return None
@@ -76,6 +85,22 @@ def depth_image_to_point_cloud(rgb, depth_m):
 
     Returns:
         o3d.geometry.PointCloud with XYZ positions and RGB colors.
+
+    SPEC:
+        Back-project every valid pixel through the module-level pinhole intrinsics
+        (fx, fy, cx, cy) with NO Open3D projection helpers.
+        - Validity: keep only pixels with depth_m > 0.
+        - For each kept pixel (u, v) with depth Z = depth_m[v, u]:
+              X = (u - cx) * Z / fx
+              Y = (v - cy) * Z / fy
+              Z = Z
+          Camera frame: +Z forward (into scene), +X right, +Y down (image order).
+        - Colors: BGR uint8 -> RGB float in [0, 1] (divide by 255, reverse channels).
+        - Return an o3d.geometry.PointCloud carrying both points (N*3) and colors,
+          one point per valid pixel, in row-major pixel order.
+        WIKI: https://en.wikipedia.org/wiki/Pinhole_camera_model
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     h, w = depth_m.shape
 
@@ -113,6 +138,18 @@ def preprocess_point_cloud(pcd, voxel_size):
     Returns:
         pcd_down : downsampled PointCloud with normals
         fpfh     : o3d.pipelines.registration.Feature
+
+    SPEC:
+        1. Voxel-downsample `pcd` at `voxel_size`.
+        2. Estimate normals on the downsample with a hybrid KD-tree search of
+           radius = voxel_size * 2.0, max_nn = 30 (needed for point-to-plane ICP
+           and for FPFH).
+        3. Compute the FPFH feature on the downsample with a hybrid KD-tree search
+           of radius = voxel_size * 5.0, max_nn = 100.
+        Return (pcd_down, fpfh). The feature radius must exceed the normal radius.
+        WIKI: https://en.wikipedia.org/wiki/Point_Feature_Histograms
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     pcd_down = pcd.voxel_down_sample(voxel_size)
 
@@ -138,6 +175,21 @@ def global_registration(source_down, target_down, source_fpfh,
 
     Returns:
         o3d.pipelines.registration.RegistrationResult
+
+    SPEC:
+        Run feature-based RANSAC (registration_ransac_based_on_feature_matching)
+        aligning `source_down` -> `target_down` from their FPFH features.
+        - Correspondence distance threshold: dist_thr = voxel_size * 1.5.
+        - mutual_filter = True; estimation = point-to-point (no scaling); ransac_n = 3.
+        - Pruning checkers: edge-length ratio 0.9 and distance <= dist_thr.
+        - Convergence: RANSACConvergenceCriteria(max_iteration=100000,
+          confidence=0.999).
+        Return the RegistrationResult; `.transformation` is the coarse 4*4 init
+        handed to ICP. (This is the fragile, non-deterministic path — see the
+        reconstruct() `robust` note.)
+        WIKI: https://en.wikipedia.org/wiki/Random_sample_consensus
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     dist_thr = voxel_size * 1.5
 
@@ -173,6 +225,18 @@ def local_icp_algorithm(source_down, target_down, trans_init, threshold):
 
     Returns:
         o3d.pipelines.registration.RegistrationResult
+
+    SPEC:
+        Refine `trans_init` with a single-threshold point-to-plane ICP.
+        - Ensure both clouds have normals; if missing, estimate with a hybrid
+          KD-tree of radius = threshold * 2, max_nn = 30.
+        - Run registration_icp(source_down, target_down, threshold, trans_init,
+          estimation = TransformationEstimationPointToPlane,
+          criteria = ICPConvergenceCriteria(max_iteration=100)).
+        Return the RegistrationResult (`.transformation` is the refined 4*4).
+        WIKI: https://en.wikipedia.org/wiki/Iterative_closest_point
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     # Guarantee normals exist on both clouds
     for pcd in (source_down, target_down):
@@ -196,7 +260,20 @@ def multiscale_icp(source_down, target_down, trans_init,
     """Coarse-to-fine point-to-plane ICP: refine `trans_init` through decreasing
     correspondence thresholds. The coarse passes give ICP a wide capture range so
     it reaches the true alignment from a constant-velocity init (a single tight
-    threshold under-converges at turns and drifts). Geometry-only."""
+    threshold under-converges at turns and drifts). Geometry-only.
+
+    SPEC:
+        Ensure both clouds have normals (hybrid KD-tree radius=0.1, max_nn=30 if
+        missing). Start T = trans_init. For each threshold in `thresholds` (coarse
+        to fine, default 0.4, 0.2, 0.1, 0.05), run point-to-plane registration_icp
+        with ICPConvergenceCriteria(max_iteration=max_iter) and feed the resulting
+        transform forward as the init for the next (finer) threshold. Return a
+        duck-typed object exposing `.transformation` (final 4*4 np.ndarray) — the
+        same attribute an Open3D RegistrationResult exposes, so callers are uniform.
+        WIKI: https://en.wikipedia.org/wiki/Iterative_closest_point
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    """
     for pcd in (source_down, target_down):
         if not pcd.has_normals():
             pcd.estimate_normals(
@@ -219,6 +296,25 @@ def my_local_icp_algorithm(source_down, target_down, trans_init, voxel_size):
     Custom point-to-point ICP (SVD per iteration, cKDTree correspondences).
 
     Returns a duck-typed result with a `.transformation` (4*4 np.ndarray).
+
+    SPEC:
+        Implement point-to-point ICP from scratch (no Open3D registration calls).
+        Setup: threshold = voxel_size * 1.5, max_iter = 60, tolerance = 1e-6.
+        Take source/target XYZ as float64 arrays; build a cKDTree on the target;
+        start T = trans_init (copied). Each iteration:
+          1. Transform source by the current T.
+          2. Nearest-neighbour correspondences (k=1) into the target via the tree.
+          3. Keep pairs with distance < threshold; if fewer than 10 survive, stop.
+          4. Solve the optimal rigid transform via the Kabsch/Umeyama SVD:
+             centre both point sets, H = Pc^T Qc, U S V^T = svd(H),
+             R = V U^T with a det(R) < 0 reflection fix (negate V's last row),
+             t = q_bar - R p_bar.
+          5. Compose the delta onto T (T = T_delta @ T).
+          6. Converge when |prev_mean_err - mean_err| < tolerance.
+        Return a duck-typed object with `.transformation` = final 4*4 T.
+        WIKI: https://en.wikipedia.org/wiki/Kabsch_algorithm
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     threshold    = voxel_size * 1.5
     max_iter     = 60
@@ -279,6 +375,7 @@ def my_local_icp_algorithm(source_down, target_down, trans_init, voxel_size):
 #  Reconstruction (headless) + metric
 # ══════════════════════════════════════════════════════════════════════════════
 def _sorted_frames(directory):
+    """List `directory`'s .png files sorted by integer stem (numeric frame order)."""
     files = [f for f in os.listdir(directory) if f.endswith('.png')]
     return sorted(files, key=lambda f: int(os.path.splitext(f)[0]))
 
@@ -290,7 +387,8 @@ def _rot_angle_deg(R):
 
 
 def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
-                build_cloud=True, robust=True, gate_trans=0.5, gate_rot=30.0):
+                build_cloud=True, robust=True, gate_trans=0.5, gate_rot=30.0,
+                down_voxel=None):
     """
     Geometry-only ICP SLAM over the frames under `data_root`.
 
@@ -323,6 +421,9 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
                     fragile student-template pipeline) for comparison.
         gate_trans/gate_rot : per-step plausibility gate (m / deg). GT steps here
                     are ~0.09 m / ~6 deg, so 0.5 m / 30 deg is generous headroom.
+        down_voxel : if set (and build_cloud), voxel-downsample each frame's world
+                    cloud before accumulating so the global map stays small (the
+                    coverage/F-score eval needs the cloud, not the full ~10^8 pts).
 
     Returns:
         (global_pcd, pred_cam_pos, gt_poses)
@@ -330,6 +431,36 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
           pred_cam_pos : (N,3) float64 — estimated camera centres in the frame-0
                          camera frame (RAW; mean_l2 handles axis reconciliation).
           gt_poses     : (M,7) float — GT [x,y,z,qw,qx,qy,qz], or None if absent.
+
+    SPEC:
+        Build a per-frame trajectory (and optionally a global map) by chaining
+        pairwise rigid registrations, GEOMETRY ONLY (colour never enters registration).
+        - Frames: numeric-sorted .png pairs from data_root/rgb and data_root/depth;
+          n_frames = min(len(rgb), len(depth)); depth via load_depth_meters; skip a
+          frame whose RGB or depth fails to load. If no cloud loads, return an empty
+          map, zeros((0,3)), and the GT.
+        - Unproject each frame to a local cloud (depth_image_to_point_cloud).
+        - Frame 0 anchors the world: T_global[0] = identity, pred_cam_pos[0] = 0.
+        - For each i>=1, register source=frame i onto target=frame i-1 (both
+          voxel-downsampled at `voxel_size`) to get a relative transform T_rel:
+            * robust=True (default): init T_rel from the constant-velocity prior
+              (previous T_rel), NO FPFH RANSAC; refine with multiscale_icp when
+              version=="open3d" (else my_local_icp_algorithm). Then a PHYSICAL GATE:
+              if ||T_rel translation|| > gate_trans OR geodesic rotation angle >
+              gate_rot, discard T_rel and coast on the prior (count as gated).
+            * robust=False: init from global_registration (FPFH RANSAC) then a
+              single-threshold local_icp_algorithm (icp_thr = voxel_size*1.5) —
+              the fragile, non-deterministic student-template chain.
+          version=="my_icp" uses my_local_icp_algorithm in both paths.
+        - Accumulate: T_i = T_global[i-1] @ T_rel; append T_i and its translation
+          T_i[:3,3] as the camera centre. If build_cloud, deep-copy frame i, apply
+          T_i, optionally voxel-downsample at down_voxel, and add into the map.
+        - GT: load data_root/GT_pose.npy (None if absent).
+        Determinism: the robust path has no uncovered RNG, so scores reproduce.
+        Return (global_pcd, pred_cam_pos as (N,3) float64, gt_poses).
+        WIKI: https://en.wikipedia.org/wiki/Simultaneous_localization_and_mapping
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     rgb_dir   = os.path.join(data_root, 'rgb')
     depth_dir = os.path.join(data_root, 'depth')
@@ -356,8 +487,11 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
         return o3d.geometry.PointCloud(), np.zeros((0, 3)), _load_gt(data_root)
 
     # ── Sequential pairwise registration ────────────────────────────────────
+    def _maybe_down(p):
+        return p.voxel_down_sample(down_voxel) if down_voxel else p
+
     T_global     = [np.eye(4)]
-    all_pcds     = [pcds[0]] if build_cloud else None
+    all_pcds     = [_maybe_down(pcds[0])] if build_cloud else None
     pred_cam_pos = [np.zeros(3)]
     T_rel_prev   = np.eye(4)          # constant-velocity prior (robust path)
     icp_thr      = voxel_size * 1.5
@@ -408,7 +542,7 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
         if build_cloud:
             pcd_i_world = copy.deepcopy(pcds[i])
             pcd_i_world.transform(T_i)
-            all_pcds.append(pcd_i_world)
+            all_pcds.append(_maybe_down(pcd_i_world))
 
         if verbose and (i % 25 == 0 or i == n - 1):
             print(f"  frame {i:>4d}/{n-1}  dt={time.time()-t0:.2f}s  gated={n_gated}")
@@ -423,6 +557,7 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
 
 
 def _load_gt(data_root):
+    """Load data_root/GT_pose.npy (the (M,7) GT pose array), or None if absent."""
     gt_path = os.path.join(data_root, 'GT_pose.npy')
     if not os.path.exists(gt_path):
         return None
@@ -439,6 +574,20 @@ def mean_l2(pred_cam_pos, gt_poses):
       * GT is Habitat world [x,y,z,...]  → flip Z to match pred's display frame.
       * origins are aligned (ICP starts at the frame-0 camera, not world origin).
     Returns +inf if either trajectory is missing/empty.
+
+    SPEC:
+        Compute the mean per-frame Euclidean distance (metres) between predicted and
+        GT camera centres over the first n = min(len(pred), len(gt)) frames.
+        - Guard: return float("inf") if either input is None or empty.
+        - Reconcile frames before comparing:
+            pred (frame-0 camera space): negate the Y column (camera -> Habitat world).
+            gt   (Habitat world x,y,z):  negate the Z column (match pred display frame).
+        - Align origins by adding offset = gt_c[0] - pred[0] to every pred point
+          (ICP starts at the frame-0 camera, not the world origin — no scale/rotation
+          fit, translation only).
+        - Return mean over i of ||pred_aligned[i] - gt_c[i]||_2.
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
     """
     if gt_poses is None or len(gt_poses) == 0 or pred_cam_pos is None \
             or len(pred_cam_pos) == 0:
@@ -460,7 +609,16 @@ def mean_l2(pred_cam_pos, gt_poses):
 #  Visualisation helpers (used by the thin reconstruct.py CLI)
 # ══════════════════════════════════════════════════════════════════════════════
 def make_trajectory(positions, color):
-    """Create an Open3D LineSet from a sequence of XYZ camera positions."""
+    """Create an Open3D LineSet from a sequence of XYZ camera positions.
+
+    SPEC:
+        Given positions (N*3) and an RGB `color` triple, build an o3d LineSet whose
+        vertices are the positions and whose edges connect each consecutive pair
+        [i, i+1] for i in 0..N-2 (a polyline through the trajectory), with every
+        line painted `color`. Return the LineSet.
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    """
     positions = np.asarray(positions)
     lines = [[i, i + 1] for i in range(len(positions) - 1)]
     ls = o3d.geometry.LineSet()
@@ -471,6 +629,16 @@ def make_trajectory(positions, color):
 
 
 def remove_ceiling(pcd, margin=0.3):
+    """Crop the ceiling out of a point cloud for a cleaner top-down view.
+
+    SPEC:
+        In the camera frame the ceiling sits at the MINIMUM y (y points down).
+        Let y_min = min of the y coordinates. Keep only points with
+        y > y_min + margin, carrying their matching colors across. Return a new
+        PointCloud of the kept points/colors (input left unmodified).
+
+    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    """
     pts  = np.asarray(pcd.points)
     cols = np.asarray(pcd.colors)
     y_min = pts[:, 1].min()                    # ceiling is at min in camera frame

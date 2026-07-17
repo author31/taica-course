@@ -34,7 +34,7 @@ def main():
 
     data_root = args.data_root
     if data_root is None:
-        data_root = ("sample_data_collection/first_floor/" if args.floor == 1
+        data_root = ("eval/_data/first_floor/baseline" if args.floor == 1
                      else "sample_data_collection/second_floor/")
 
     t0 = time.time()

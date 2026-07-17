@@ -12,11 +12,18 @@ FOR EACH (floor, axis):
      (one sim per config) and the GT pose is exact (teleport replay, identical
      across axes). `--output-root` overrides the config's output.root (B3);
      `--fps` fixes the flicker time base so flicker is reproducible (B1).
-  2. SCORE    — utils.reconstruct(...) (geometry-only ICP, build_cloud=False) →
-     predicted camera trajectory; utils.mean_l2 vs the GT poses.
+  2. SCORE    — utils.reconstruct(...) (geometry-only ICP) → predicted camera
+     trajectory + a downsampled reconstruction cloud. Two metrics:
+       * mean L2 (utils.mean_l2)          — trajectory error vs GT poses.
+       * F-score (hw1/completeness.py)    — coverage-aware accuracy/completeness.
+     The whole-floor GT reference for the F-score is built once per floor from
+     that floor's BASELINE capture, GT-posed. Reconstruction clouds are lifted
+     into the world by a single anchor transform (the first camera's GT pose) —
+     no trajectory fitting.
 
 OUTPUTS (eval/):
   results.csv            rows = floor, cols = axis, cells = mean L2 (m).
+  fscore.csv             rows = (floor, axis), accuracy / completeness / F @ tau.
   radar_firstfloor.png   one radar per floor: 3 spokes (low_light, over_exposure,
   radar_secondfloor.png  flicker), single series = that floor's mean L2, with the
                          baseline drawn as a dashed reference ring.
@@ -36,7 +43,8 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "hw1"))
-import utils   # noqa: E402  (geometry-only ICP reconstruct + mean_l2)
+import utils          # noqa: E402  (geometry-only ICP reconstruct + mean_l2)
+import completeness   # noqa: E402  (anchor + accuracy/completeness/F-score)
 
 # Axis order used everywhere (CSV columns, radar spokes minus baseline).
 AXES = ["baseline", "low_light", "over_exposure", "flicker"]
@@ -76,11 +84,18 @@ def collect(config, traj, out_root, fps):
     subprocess.run(cmd, cwd=REPO, check=True)
 
 
-def score(data_root, version):
-    """Reconstruct the capture and return mean L2 (m)."""
-    _, pred, gt = utils.reconstruct(data_root, version, verbose=False,
-                                    build_cloud=False)
-    return utils.mean_l2(pred, gt)
+def score(data_root, version, gt_ref):
+    """Reconstruct the capture once and return (mean_L2, fscore_dict|None).
+
+    Builds the (downsampled) cloud so the coverage/F-score can reuse it; the F
+    part is skipped (None) when no whole-floor GT reference is available."""
+    pcd, pred, gt = utils.reconstruct(data_root, version, verbose=False,
+                                      build_cloud=True, down_voxel=0.05)
+    l2 = utils.mean_l2(pred, gt)
+    fs = None
+    if gt_ref is not None and gt is not None and len(gt) > 0:
+        fs = completeness.fscore_for_capture(pcd, gt, gt_ref)
+    return l2, fs
 
 
 def write_csv(results, path):
@@ -93,6 +108,24 @@ def write_csv(results, path):
                 continue
             w.writerow([floor] + [f"{results[floor].get(a, float('nan')):.4f}"
                                   for a in AXES])
+    print(f"[write] {path}")
+
+
+def write_fscore_csv(fresults, path, tau=completeness.PRIMARY_TAU):
+    """fresults[floor][axis] = score dict. One row per (floor, axis) with the
+    accuracy / completeness / F triple at the primary tau."""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["floor", "axis", "tau", "accuracy", "completeness", "f_score"])
+        for floor in FLOORS:
+            for axis in AXES:
+                fs = fresults.get(floor, {}).get(axis)
+                if fs is None:
+                    continue
+                s = fs[tau]
+                w.writerow([floor, axis, f"{tau:.2f}",
+                            f"{s['accuracy']:.4f}", f"{s['completeness']:.4f}",
+                            f"{s['f']:.4f}"])
     print(f"[write] {path}")
 
 
@@ -158,6 +191,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     results = {}
+    fresults = {}
 
     for floor in args.floors:
         spec = FLOORS[floor]
@@ -166,31 +200,67 @@ def main():
             print(f"[skip] {floor}: missing trajectory {spec['traj']}")
             continue
         results[floor] = {}
+        fresults[floor] = {}
+
+        # Whole-floor GT reference (for the coverage/F-score) is built from the
+        # floor's BASELINE capture. Ensure it exists, then build it up-front so it
+        # is available while scoring every axis (including baseline itself).
+        base_root = os.path.join(REPO, args.data_root, floor, "baseline")
+        collected = set()
+        if not args.no_collect and "baseline" in spec["configs"]:
+            collect(spec["configs"]["baseline"], traj, base_root, args.fps)
+            collected.add("baseline")
+        gt_ref = None
+        if os.path.isdir(os.path.join(base_root, "rgb")):
+            print(f"  [gt-ref] building whole-floor reference from {floor}/baseline ...")
+            gt_ref = completeness.build_gt_reference(base_root)
+            print(f"  [gt-ref] {len(gt_ref.points)} points")
+        else:
+            print(f"  [gt-ref] no baseline capture for {floor}; F-score skipped")
+
         for axis in args.axes:
             out_root = os.path.join(REPO, args.data_root, floor, axis)
-            if not args.no_collect:
+            if not args.no_collect and axis not in collected:
                 collect(spec["configs"][axis], traj, out_root, args.fps)
             if not os.path.isdir(os.path.join(out_root, "rgb")):
                 print(f"  [skip] {floor}/{axis}: no capture at {out_root}")
                 continue
-            l2 = score(out_root, args.version)
+            l2, fs = score(out_root, args.version, gt_ref)
             results[floor][axis] = l2
-            print(f"  [score] {floor}/{axis}: mean L2 = {l2:.4f} m")
+            if fs is not None:
+                fresults[floor][axis] = fs
+                s = fs[completeness.PRIMARY_TAU]
+                print(f"  [score] {floor}/{axis}: mean L2 = {l2:.4f} m | "
+                      f"F@{completeness.PRIMARY_TAU} = {s['f']:.3f} "
+                      f"(acc {s['accuracy']:.3f}, comp {s['completeness']:.3f})")
+            else:
+                print(f"  [score] {floor}/{axis}: mean L2 = {l2:.4f} m")
 
     write_csv(results, os.path.join(args.out_dir, "results.csv"))
+    write_fscore_csv(fresults, os.path.join(args.out_dir, "fscore.csv"))
     for floor in args.floors:
         if results.get(floor):
             radar(floor, results[floor],
                   os.path.join(args.out_dir, f"radar_{floor.replace('_floor','floor')}.png"))
 
-    # console summary table
-    print("\n=== mean L2 (m) ===")
+    # console summary tables
+    print("\n=== mean L2 (m)  [lower = better trajectory] ===")
     print("floor".ljust(14) + "".join(a.ljust(15) for a in AXES))
     for floor in args.floors:
         if results.get(floor):
             row = results[floor]
             print(floor.ljust(14) + "".join(
                 (f"{row.get(a, float('nan')):.4f}").ljust(15) for a in AXES))
+
+    tau = completeness.PRIMARY_TAU
+    print(f"\n=== F-score @ tau={tau} m  [higher = better; couples accuracy + coverage] ===")
+    print("floor".ljust(14) + "".join(a.ljust(15) for a in AXES))
+    for floor in args.floors:
+        row = fresults.get(floor)
+        if row:
+            print(floor.ljust(14) + "".join(
+                (f"{row[a][tau]['f']:.3f}" if a in row else "n/a").ljust(15)
+                for a in AXES))
 
 
 if __name__ == "__main__":
