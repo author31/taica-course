@@ -3,8 +3,8 @@ Headless whole-map trajectory search for the Habitat data collector.
 
 ================================================================================
 WHAT THIS IS
-    scripts/load.py is an *interactive* collector: a human drives the agent in a
-    pygame window and hand-picks frames. scripts/reconstruct.py chains
+    hw1/load.py is an *interactive* collector: a human drives the agent in a
+    pygame window and hand-picks frames. hw1/reconstruct.py chains
     frame-to-frame ICP over those captures and scores the run by the mean L2
     distance between the predicted camera trajectory and the ground-truth one.
 
@@ -41,7 +41,7 @@ WHY SHORT PATH + A CLOSING LOOP IS THE LEVER
 
 HOW TO RUN
     pixi run -e habitat python scripts/search_traj.py \
-        [--config scripts/config.yaml] [--target 0.3] [--revisit closed] \
+        [--config hw1/configs/second_floor.yaml] [--target 0.3] [--revisit closed] \
         [--waypoints N] [--iters 4] [--version open3d|my_icp] \
         [--out best_trajectory.npy] [--save-best-data]
 
@@ -63,12 +63,13 @@ import tempfile
 import numpy as np
 import cv2
 
-# Import the collector and SLAM utils as libraries from hw1/. load.py sets the
-# SDL software-render env vars and imports habitat at module load; harmless here
-# (no pygame window is ever opened). utils.py pulls in open3d.
+# Sim core comes from the shared simulator package (pixi editable install);
+# simulator.viewer (the only pygame module) is never imported here. SLAM utils
+# still live in hw1/ (utils.py pulls in open3d).
 _HW1 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hw1")
 sys.path.insert(0, _HW1)
-import load
+from simulator import (load_config, make_cfg, add_start_marker,
+                       process_observations)
 import utils
 
 try:                                    # exact follower failure type when present
@@ -94,20 +95,20 @@ WAYPOINT_SCHEDULE = [3, 4, 5, 6]
 # Headless simulator
 # =============================================================================
 def build_sim(config):
-    """Construct the habitat Simulator + agent like load.main(), without pygame.
-    DISPLAY is hidden during construction so habitat renders offscreen on EGL
-    (see the GL workaround note in load.py)."""
+    """Construct a raw habitat Simulator + agent (no pygame) via the shared
+    simulator package's make_cfg. DISPLAY is hidden during construction so
+    habitat renders offscreen on EGL (same GL workaround as simulator.Engine)."""
     import habitat_sim
 
     saved_display = os.environ.pop("DISPLAY", None)
     try:
-        sim = habitat_sim.Simulator(load.make_cfg(config))
+        sim = habitat_sim.Simulator(make_cfg(config))
     finally:
         if saved_display is not None:
             os.environ["DISPLAY"] = saved_display
 
     agent = sim.initialize_agent(0)
-    load.add_start_marker(sim, config)
+    add_start_marker(sim, config)
     return sim, agent
 
 
@@ -235,7 +236,7 @@ def build_goal_sequence(start, tour, mode):
 # =============================================================================
 def capture_frame(sim, agent, config):
     obs = sim.get_sensor_observations()
-    frame = load.process_observations(obs, config)
+    frame = process_observations(obs, config)
     ss = agent.get_state().sensor_states["color_sensor"]
     p, r = ss.position, ss.rotation
     return frame, [p[0], p[1], p[2], r.w, r.x, r.y, r.z]
@@ -368,7 +369,9 @@ def rollout(config, args, waypoints, wp_seed, work_root, navmesh):
 def run_workflow(config, args):
     navmesh = args.navmesh or _default_navmesh(config)
     work_root = tempfile.mkdtemp(prefix="traj_search_")
-    wp_seed = int(config.get("seed") or 0)
+    # Single-seed policy: uncertainties.seed also seeds waypoint sampling
+    # (the legacy top-level `seed:` key is gone from the new config schema).
+    wp_seed = int(config.get("uncertainties", {}).get("seed") or 0)
 
     best = {"l2": float("inf"), "actions": None, "poses": None,
             "waypoints": None, "num_waypoints": None}
@@ -415,7 +418,9 @@ def _default_navmesh(config):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    default_config = os.path.join(os.path.dirname(__file__), "config.yaml")
+    default_config = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "hw1", "configs", "second_floor.yaml")
     parser.add_argument("--config", default=default_config)
     parser.add_argument("--navmesh", default=None,
                         help="explicit .navmesh path (default: next to the mesh)")
@@ -440,11 +445,9 @@ def main():
                              "reconstruct.py can render it")
     args = parser.parse_args()
 
-    config = load.load_config(args.config)
+    config = load_config(args.config)
     # Target the Replica apartment_0 habitat scene regardless of stale config.
     config["scene"]["path"] = "replica_v1/apartment_0/habitat/mesh_semantic.ply"
-    if config.get("seed") is not None:
-        np.random.seed(int(config["seed"]))
 
     best = run_workflow(config, args)
 

@@ -1,0 +1,60 @@
+# valid_frames.rq — SELECT the PASS frames of one batch.
+#
+# A "PASS" frame is one that clears the band of every one of the four quality
+# factors at once. What each factor measures is the measurement contract in
+# definitions.md; the bounds themselves are yours, from thresholds.json. All four
+# bands are ONE-SIDED — each factor contributes exactly one comparison, not a
+# range. Watch the directions: they do NOT all point the same way. Exactly one
+# factor is more-is-better; the other three are less-is-better:
+#
+#   validDepthFraction     >= @@DMIN@@     more valid depth is better
+#   depthRoughness         <= @@RMAX@@     noise sigma in metres, LOWER is better
+#   clipHiFraction         <= @@CLIPHI@@   less blown-out is better
+#   clipLoFraction         <= @@CLIPLO@@   less crushed is better
+#
+# Copying a comparison operator from the line above it is the easiest way to get
+# a query that runs, returns rows, and is wrong.
+#
+# Each batch is stored in its OWN named graph (<ns>batch/<name>), so the dataset's
+# default graph is empty — the pattern MUST match inside GRAPH ?g or the query
+# returns zero rows against a perfectly healthy store. The batchName triple pins
+# ?g to the requested batch.
+#
+# ---- substitution-token contract ----
+#
+# This is a TEMPLATE, not directly runnable. api.py build_select() substitutes
+# these double-at-bracketed tokens before sending the text to Fuseki:
+#
+#   @@NS@@       the ontology namespace IRI
+#   @@BATCH@@    the batch name, already SPARQL-escaped
+#   @@DMIN@@     min valid-depth fraction        (float literal)
+#   @@RMAX@@     max depth roughness, in metres  (float literal)
+#   @@CLIPHI@@   max highlight-clip fraction     (float literal)
+#   @@CLIPLO@@   max shadow-clip fraction        (float literal)
+#
+# The four bounds come from resolve_band(), i.e. from thresholds.json. They are
+# floats we control, so injecting them inline is safe; @@BATCH@@ is not, which is
+# why build_select() escapes it and substitutes it LAST — a batch name that
+# happens to contain a token string then cannot corrupt the query.
+#
+# Bands are applied HERE, at retrieve time. Re-deriving a band costs one re-run of
+# retrieve, not a re-insert. (tau is the opposite: it is baked into the stored
+# clip fractions at insert time. Change tau and you must re-insert.)
+PREFIX hw1: <@@NS@@>
+PREFIX schema: <https://schema.org/>
+SELECT ?idx ?rgb ?depth ?vdf ?rough ?cliphi ?cliplo WHERE {
+  GRAPH ?g {
+    # #TODO: match the batch named "@@BATCH@@" and walk
+    #          Batch -hasFrame-> Frame -hasRGBImage/hasDepthImage-> component
+    #        binding every variable in the SELECT list above:
+    #          ?idx    frameIndex on the Frame
+    #          ?rgb    ?depth     schema:contentUrl on the two component nodes
+    #          ?vdf    ?rough     observables on the DepthImage
+    #          ?cliphi ?cliplo    observables on the RGBImage
+    #
+    # #TODO: one FILTER with four one-sided terms, ANDed, using the four bound
+    #        tokens above. Every term is required — a frame passes only if it
+    #        clears all four. Three of the four comparisons are `<=`; only the
+    #        valid-depth term is `>=` (see the band table at the top).
+  }
+} ORDER BY ?idx

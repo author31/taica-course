@@ -1,5 +1,16 @@
+# --- instructor-only tree (NEVER publish) ---
+# Reference solution, derived thresholds, sweep harness, floor-1 assets.
+# Ignored rather than kept on a private branch so it is mechanically impossible
+# to commit -> impossible to push to the student remote. See instructor/README.md
+# for how to version it separately.
+instructor/
+
 # --- project data / envs ---
 outputs
+# Fuseki server binary (downloaded via `pixi run -e fuseki fuseki`)
+hw1/fuseki_bin/
+# Fuseki runtime state (databases/, logs/, shiro.ini) — created in CWD on server start
+run/
 # pixi environments (rebuilt from pixi.lock via `pixi install`)
 .pixi/
 data_collection/
