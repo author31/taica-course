@@ -1,0 +1,22 @@
+# valid_frames.rq — SELECT the PASS frames of one batch.
+#
+# A "PASS" frame is one whose avg_luma_rec601 is within [BMIN, BMAX] AND whose
+# valid_depth_fraction is >= DMIN. Each batch is stored in its OWN named graph
+# (<ns>batch/<name>), so the dataset's default graph is empty — the pattern must
+# match inside GRAPH ?g (the batchName triple pins ?g to the requested batch).
+#
+# This is a TEMPLATE, not directly runnable. hw1/api.py build_select() substitutes
+# five double-at-bracketed tokens before sending it to Fuseki: the ontology
+# namespace, the SPARQL-escaped batch name, and the three float band bounds
+# (low/high luma, min valid-depth). See build_select() for the token list.
+PREFIX hw1: <@@NS@@>
+SELECT ?idx ?rgb ?depth ?luma ?vdf WHERE {
+  GRAPH ?g {
+    ?b hw1:batchName "@@BATCH@@" ; hw1:hasFrame ?f .
+    ?f hw1:frameIndex ?idx ; hw1:avgLuma ?luma ; hw1:validDepthFraction ?vdf ;
+       hw1:hasComponent ?rc , ?dc .
+    ?rc a hw1:RGBImage ; hw1:imagePath ?rgb .
+    ?dc a hw1:DepthImage ; hw1:imagePath ?depth .
+    FILTER(?luma >= @@BMIN@@ && ?luma <= @@BMAX@@ && ?vdf >= @@DMIN@@)
+  }
+} ORDER BY ?idx

@@ -1,43 +1,48 @@
 """
-HW1 robustness / generalization evaluator.
+HW1 robustness evaluator — two-run (baseline vs mixed) temporal-uncertainty eval.
 
-Orchestrates the whole metric sweep for the two floors and the three lighting
-perturbation axes (+ a neutral baseline), then writes a results table and one
-radar chart per floor.
+ONE config (hw1/configs/second_floor.yaml), TWO in-process runs of the same
+trajectory replay (no subprocess, no pygame — simulator.viewer is never imported):
 
-FOR EACH (floor, axis):
-  1. COLLECT  — subprocess `hw1/load.py` to REPLAY the floor's trajectory through
-     that axis's config, writing rgb/ depth/ GT_pose.npy into
-     eval/_data/<floor>/<axis>/. A subprocess isolates the habitat-sim lifecycle
-     (one sim per config) and the GT pose is exact (teleport replay, identical
-     across axes). `--output-root` overrides the config's output.root (B3);
-     `--fps` fixes the flicker time base so flicker is reproducible (B1).
-  2. SCORE    — utils.reconstruct(...) (geometry-only ICP) → predicted camera
-     trajectory + a downsampled reconstruction cloud. Two metrics:
-       * mean L2 (utils.mean_l2)          — trajectory error vs GT poses.
-       * F-score (hw1/completeness.py)    — coverage-aware accuracy/completeness.
-     The whole-floor GT reference for the F-score is built once per floor from
-     that floor's BASELINE capture, GT-posed. Reconstruction clouds are lifted
-     into the world by a single anchor transform (the first camera's GT pose) —
-     no trajectory fitting.
+  1. COLLECT — simulator.Engine + simulator.replay_poses over config["trajectory"]:
+       run 1: scheduler OFF (uncertainties.enabled=False) -> <output.root>/baseline/
+       run 2: scheduler ON  (UncertaintyScheduler(cfg))   -> <output.root>/mixed/
+     Each run writes rgb/ depth/ GT_pose.npy; the mixed run also persists the
+     realized uncertainty windows to windows.json (seconds — window ground truth,
+     kept outside the ontology store). A missing trajectory file is a HARD ERROR
+     (no silent [skip]).
+
+  2. SCORE — utils.reconstruct (geometry-only ICP) per condition:
+       * mean L2 (per-frame trajectory error vs GT poses; same reconciliation as
+         utils.mean_l2).
+       * F-score (hw1/completeness.py) — coverage-aware accuracy/completeness.
+         The whole-floor GT reference is built from baseline/ ONLY.
+     Reported for the WHOLE EPISODE (per condition) and PER WINDOW: each window
+     (start_s, end_s) from windows.json maps to 1-indexed frame indices via
+       frame_start = max(1, round(start_s * fps)),  frame_end = round(end_s * fps)
+     (replay time base t = i / fps, frames come 1-indexed from replay). Per-window
+     rows report the mixed-run mean L2 inside the window next to the baseline run
+     over the SAME frames; a final "clean" row covers all frames outside every
+     window.
 
 OUTPUTS (eval/):
-  results.csv            rows = floor, cols = axis, cells = mean L2 (m).
-  fscore.csv             rows = (floor, axis), accuracy / completeness / F @ tau.
-  radar_firstfloor.png   one radar per floor: 3 spokes (low_light, over_exposure,
-  radar_secondfloor.png  flicker), single series = that floor's mean L2, with the
-                         baseline drawn as a dashed reference ring.
+  results.csv            one row per condition: mean L2 + accuracy/completeness/F.
+  per_window.csv         one row per uncertainty window (+ the clean remainder).
 
 RUN (pixi habitat env — habitat-sim + open3d both live there):
-  pixi run -e habitat python scripts/evaluate.py                 # full sweep
-  pixi run -e habitat python scripts/evaluate.py --no-collect    # rescore existing _data
-  pixi run -e habitat python scripts/evaluate.py --floors first_floor
+  pixi run -e habitat python scripts/evaluate.py                  # collect + score
+  pixi run -e habitat python scripts/evaluate.py --no-collect     # rescore existing
+  pixi run -e habitat python scripts/evaluate.py --no-collect --data-root DIR
+                              # rescore an arbitrary <root>/{baseline,mixed} tree
+                              # (sim-free: the simulator package is not imported)
 """
 import os
 import sys
 import csv
+import json
+import copy
+import shutil
 import argparse
-import subprocess
 
 import numpy as np
 
@@ -46,221 +51,299 @@ sys.path.insert(0, os.path.join(REPO, "hw1"))
 import utils          # noqa: E402  (geometry-only ICP reconstruct + mean_l2)
 import completeness   # noqa: E402  (anchor + accuracy/completeness/F-score)
 
-# Axis order used everywhere (CSV columns, radar spokes minus baseline).
-AXES = ["baseline", "low_light", "over_exposure", "flicker"]
-PERTURB_AXES = ["low_light", "over_exposure", "flicker"]   # radar spokes
-
-# (floor -> trajectory + per-axis config). The floor is selected by the
-# trajectory that gets replayed; the config supplies the lighting severity.
-FLOORS = {
-    "first_floor": {
-        "traj": "trajectories/firstfloor.npy",
-        "configs": {
-            "baseline":      "configs/baseline.firstfloor.yaml",
-            "low_light":     "configs/robustness.low_light.firstfloor.yaml",
-            "over_exposure": "configs/robustness.over_exposure.firstfloor.yaml",
-            "flicker":       "configs/robustness.flicker.firstfloor.yaml",
-        },
-    },
-    "second_floor": {
-        "traj": "trajectories/secondfloor.npy",
-        "configs": {
-            "baseline":      "configs/baseline.secondfloor.yaml",
-            "low_light":     "configs/generalization.low_light.secondfloor.yaml",
-            "over_exposure": "configs/generalization.over_exposure.secondfloor.yaml",
-            "flicker":       "configs/generalization.flicker.secondfloor.yaml",
-        },
-    },
-}
+DEFAULT_CONFIG = os.path.join("hw1", "configs", "second_floor.yaml")
+CONDITIONS = ("baseline", "mixed")   # run order: baseline feeds the GT reference
 
 
-def collect(config, traj, out_root, fps):
-    """Replay `traj` through `config` into out_root (rgb/ depth/ GT_pose.npy)."""
-    os.makedirs(out_root, exist_ok=True)
-    cmd = [sys.executable, os.path.join(REPO, "hw1", "load.py"),
-           "--config", config, "--trajectory", traj,
-           "--output-root", out_root, "--fps", str(fps)]
-    print(f"  [collect] {os.path.basename(config)} -> {out_root}")
-    subprocess.run(cmd, cwd=REPO, check=True)
+def _abspath(p):
+    return p if os.path.isabs(p) else os.path.join(REPO, p)
 
 
-def score(data_root, version, gt_ref):
-    """Reconstruct the capture once and return (mean_L2, fscore_dict|None).
+# =============================================================================
+# COLLECT — in-process two-run replay. The simulator package is imported lazily
+# so the rescore path (--no-collect) never needs habitat; viewer is NEVER imported.
+# =============================================================================
+def _prepare_capture_dirs(data_root, out_cfg):
+    if out_cfg.get("clear_existing", False) and os.path.isdir(data_root):
+        shutil.rmtree(data_root)
+    subs = ["rgb", "depth"]
+    if out_cfg.get("save_semantic", False):
+        subs.append("semantic")
+    for sub in subs:
+        os.makedirs(os.path.join(data_root, sub), exist_ok=True)
 
-    Builds the (downsampled) cloud so the coverage/F-score can reuse it; the F
-    part is skipped (None) when no whole-floor GT reference is available."""
+
+def collect(config, fps):
+    """Replay config["trajectory"] twice from the ONE config: scheduler disabled
+    -> <output.root>/baseline/, scheduler enabled -> <output.root>/mixed/.
+    Returns the absolute output root. Missing trajectory raises."""
+    from simulator import (Engine, UncertaintyScheduler, load_trajectory,
+                           replay_poses, save_frame)
+
+    traj = _abspath(config["trajectory"])
+    if not os.path.exists(traj):
+        raise FileNotFoundError(
+            f"trajectory not found: {traj} — generate it with "
+            "scripts/search_traj.py (missing trajectory is a hard error)")
+    poses = load_trajectory(traj)
+    root = _abspath(config["output"]["root"])
+
+    for cond in CONDITIONS:
+        cfg = copy.deepcopy(config)
+        cfg["uncertainties"]["enabled"] = (cond == "mixed")
+        scheduler = (UncertaintyScheduler(cfg["uncertainties"])
+                     if cfg["uncertainties"]["enabled"] else None)
+        data_root = os.path.join(root, cond)
+        _prepare_capture_dirs(data_root, cfg["output"])
+        print(f"[collect] {cond}: replaying {len(poses)} poses -> {data_root}")
+
+        engine = Engine(cfg, scheduler=scheduler, fps_nominal=fps)
+        try:
+            def out_cb(frame, sensor_state, idx,
+                       _root=data_root, _out=cfg["output"]):
+                save_frame(frame, sensor_state, _root, _out, idx)
+
+            captured = replay_poses(engine, poses, out_cb)
+            np.save(os.path.join(data_root, "GT_pose.npy"),
+                    np.asarray(captured, dtype=np.float32))
+            if scheduler is not None:
+                scheduler.save(os.path.join(data_root, "windows.json"))
+                print(f"[collect] {cond}: {len(scheduler.windows)} uncertainty "
+                      f"windows -> windows.json")
+        finally:
+            engine.close()
+    return root
+
+
+# =============================================================================
+# SCORE — sim-free metric path (reconstruction + per-frame L2 + F-score)
+# =============================================================================
+def per_frame_l2(pred_cam_pos, gt_poses):
+    """Per-frame L2 errors (metres), same frame reconciliation as utils.mean_l2
+    (whole-episode mean of this array == utils.mean_l2). None if either side is
+    missing/empty. Index k <-> capture frame k+1 (frames are 1-indexed)."""
+    if gt_poses is None or len(gt_poses) == 0 \
+            or pred_cam_pos is None or len(pred_cam_pos) == 0:
+        return None
+    pred = np.asarray(pred_cam_pos, dtype=np.float64).copy()
+    pred[:, 1] *= -1                                   # cam -> habitat world
+    gt_c = np.asarray(gt_poses, dtype=np.float64)[:, :3].copy()
+    gt_c[:, 2] *= -1                                   # match pred display frame
+    n = min(len(pred), len(gt_c))
+    pred_al = pred[:n] + (gt_c[0] - pred[0])           # align origins
+    return np.linalg.norm(pred_al - gt_c[:n], axis=1)
+
+
+def score_condition(data_root, version, gt_ref):
+    """Reconstruct one condition's capture. Returns (per-frame L2 array|None,
+    fscore dict|None). Missing capture is a hard error."""
+    if not os.path.isdir(os.path.join(data_root, "rgb")):
+        raise FileNotFoundError(
+            f"no capture at {data_root} — run evaluate.py without --no-collect")
     pcd, pred, gt = utils.reconstruct(data_root, version, verbose=False,
                                       build_cloud=True, down_voxel=0.05)
-    l2 = utils.mean_l2(pred, gt)
+    errs = per_frame_l2(pred, gt)
     fs = None
     if gt_ref is not None and gt is not None and len(gt) > 0:
         fs = completeness.fscore_for_capture(pcd, gt, gt_ref)
-    return l2, fs
+    return errs, fs
 
 
-def write_csv(results, path):
-    """results[floor][axis] = mean L2. Rows = floor, cols = axis."""
+def load_windows(mixed_root):
+    """Realized uncertainty windows ([{start_s, end_s, type, params}]) from the
+    mixed run's windows.json; [] (with a warning) if absent."""
+    path = os.path.join(mixed_root, "windows.json")
+    if not os.path.exists(path):
+        print(f"[warn] {path} missing — per-window breakdown skipped")
+        return []
+    with open(path) as f:
+        return json.load(f)
+
+
+def window_frame_range(win, fps, n_frames):
+    """Map one (start_s, end_s) window to inclusive 1-indexed frame bounds under
+    the replay time base t = i / fps. Empty window <-> f1 < f0."""
+    f0 = max(1, int(round(float(win["start_s"]) * fps)))
+    f1 = min(n_frames, int(round(float(win["end_s"]) * fps)))
+    return f0, f1
+
+
+def per_window_rows(windows, errs_mixed, errs_base, fps):
+    """One metric row per window + a trailing 'clean' row for frames outside
+    every window. Returns (rows, covered_mask)."""
+    n = 0 if errs_mixed is None else len(errs_mixed)
+    covered = np.zeros(n, dtype=bool)
+    rows = []
+    for k, w in enumerate(windows):
+        f0, f1 = window_frame_range(w, fps, n)
+        empty = not n or f1 < f0                   # window outside the capture
+        row = {"window": k, "type": w.get("type", "?"),
+               "start_s": float(w["start_s"]), "end_s": float(w["end_s"]),
+               "frame_start": "" if empty else f0,
+               "frame_end": "" if empty else f1,
+               "n_frames": 0 if empty else f1 - f0 + 1,
+               "l2_mixed": float("nan"), "l2_baseline": float("nan")}
+        if not empty:
+            sl = slice(f0 - 1, f1)                 # 1-indexed frames -> 0-based
+            covered[sl] = True
+            row["l2_mixed"] = float(np.mean(errs_mixed[sl]))
+            if errs_base is not None and len(errs_base) >= f1:
+                row["l2_baseline"] = float(np.mean(errs_base[sl]))
+        rows.append(row)
+
+    if n:
+        clean = ~covered
+        rows.append({
+            "window": "clean", "type": "none",
+            "start_s": float("nan"), "end_s": float("nan"),
+            "frame_start": "", "frame_end": "",
+            "n_frames": int(clean.sum()),
+            "l2_mixed": float(np.mean(errs_mixed[clean])) if clean.any() else float("nan"),
+            "l2_baseline": (float(np.mean(errs_base[clean[:len(errs_base)]]))
+                            if errs_base is not None and clean[:len(errs_base)].any()
+                            else float("nan")),
+        })
+    return rows, covered
+
+
+def write_results_csv(results, path, tau=completeness.PRIMARY_TAU):
+    """Whole-episode summary: one scored row per condition."""
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["floor"] + AXES)
-        for floor in FLOORS:
-            if floor not in results:
+        w.writerow(["condition", "n_frames", "mean_l2", "tau",
+                    "accuracy", "completeness", "f_score"])
+        for cond in CONDITIONS:
+            r = results.get(cond)
+            if r is None:
                 continue
-            w.writerow([floor] + [f"{results[floor].get(a, float('nan')):.4f}"
-                                  for a in AXES])
-    print(f"[write] {path}")
-
-
-def write_fscore_csv(fresults, path, tau=completeness.PRIMARY_TAU):
-    """fresults[floor][axis] = score dict. One row per (floor, axis) with the
-    accuracy / completeness / F triple at the primary tau."""
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["floor", "axis", "tau", "accuracy", "completeness", "f_score"])
-        for floor in FLOORS:
-            for axis in AXES:
-                fs = fresults.get(floor, {}).get(axis)
-                if fs is None:
-                    continue
-                s = fs[tau]
-                w.writerow([floor, axis, f"{tau:.2f}",
+            n = 0 if r["errs"] is None else len(r["errs"])
+            if r["fs"] is not None:
+                s = r["fs"][tau]
+                w.writerow([cond, n, f"{r['l2']:.4f}", f"{tau:.2f}",
                             f"{s['accuracy']:.4f}", f"{s['completeness']:.4f}",
                             f"{s['f']:.4f}"])
+            else:
+                w.writerow([cond, n, f"{r['l2']:.4f}", f"{tau:.2f}", "", "", ""])
     print(f"[write] {path}")
 
 
-def radar(floor, row, path):
-    """One radar per floor: PERTURB_AXES spokes, series = mean L2, baseline as a
-    dashed reference ring."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    vals = [row.get(a, float("nan")) for a in PERTURB_AXES]
-    baseline = row.get("baseline", float("nan"))
-
-    angles = np.linspace(0, 2 * np.pi, len(PERTURB_AXES), endpoint=False)
-    angles_closed = np.concatenate([angles, angles[:1]])
-    vals_closed = vals + vals[:1]
-
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"polar": True})
-    ax.set_theta_offset(np.pi / 2)
-    ax.set_theta_direction(-1)
-
-    ax.plot(angles_closed, vals_closed, color="tab:red", linewidth=2,
-            label="mean L2 (perturbed)")
-    ax.fill(angles_closed, vals_closed, color="tab:red", alpha=0.20)
-
-    if np.isfinite(baseline):
-        ring = [baseline] * len(angles_closed)
-        ax.plot(angles_closed, ring, color="black", linewidth=1.5,
-                linestyle="--", label=f"baseline = {baseline:.3f} m")
-
-    ax.set_xticks(angles)
-    ax.set_xticklabels([a.replace("_", " ") for a in PERTURB_AXES])
-    # annotate each spoke with its value
-    for ang, v in zip(angles, vals):
-        if np.isfinite(v):
-            ax.annotate(f"{v:.3f}", xy=(ang, v), fontsize=9,
-                        ha="center", va="bottom")
-    ax.set_title(f"{floor} — mean L2 vs lighting perturbation", pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.10), fontsize=9)
-    fig.tight_layout()
-    fig.savefig(path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
+def write_per_window_csv(rows, path):
+    cols = ["window", "type", "start_s", "end_s", "frame_start", "frame_end",
+            "n_frames", "l2_mixed", "l2_baseline"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r["window"], r["type"],
+                        "" if isinstance(r["start_s"], float) and np.isnan(r["start_s"]) else f"{r['start_s']:.3f}",
+                        "" if isinstance(r["end_s"], float) and np.isnan(r["end_s"]) else f"{r['end_s']:.3f}",
+                        r["frame_start"], r["frame_end"], r["n_frames"],
+                        "" if np.isnan(r["l2_mixed"]) else f"{r['l2_mixed']:.4f}",
+                        "" if np.isnan(r["l2_baseline"]) else f"{r['l2_baseline']:.4f}"])
     print(f"[write] {path}")
 
 
+def print_tables(results, rows, tau=completeness.PRIMARY_TAU):
+    print("\n=== whole episode ===")
+    hdr = ["condition", "frames", "mean L2 (m)", f"F@{tau}", "acc", "comp"]
+    print("".join(h.ljust(14) for h in hdr))
+    for cond in CONDITIONS:
+        r = results.get(cond)
+        if r is None:
+            continue
+        n = 0 if r["errs"] is None else len(r["errs"])
+        if r["fs"] is not None:
+            s = r["fs"][tau]
+            cells = [cond, str(n), f"{r['l2']:.4f}", f"{s['f']:.3f}",
+                     f"{s['accuracy']:.3f}", f"{s['completeness']:.3f}"]
+        else:
+            cells = [cond, str(n), f"{r['l2']:.4f}", "n/a", "n/a", "n/a"]
+        print("".join(c.ljust(14) for c in cells))
+
+    if rows:
+        print("\n=== per-window breakdown (mixed run; baseline over same frames) ===")
+        hdr = ["window", "type", "t (s)", "frames", "n", "L2 mixed", "L2 base"]
+        print("".join(h.ljust(15) for h in hdr))
+        for r in rows:
+            t_span = ("" if isinstance(r["start_s"], float) and np.isnan(r["start_s"])
+                      else f"{r['start_s']:.2f}-{r['end_s']:.2f}")
+            if r["frame_start"] != "":
+                f_span = f"{r['frame_start']}-{r['frame_end']}"
+            else:
+                f_span = "outside" if r["window"] == "clean" else "none"
+            cells = [str(r["window"]), r["type"], t_span, f_span,
+                     str(r["n_frames"]),
+                     "n/a" if np.isnan(r["l2_mixed"]) else f"{r['l2_mixed']:.4f}",
+                     "n/a" if np.isnan(r["l2_baseline"]) else f"{r['l2_baseline']:.4f}"]
+            print("".join(c.ljust(15) for c in cells))
+
+
+# =============================================================================
+# Main
+# =============================================================================
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--floors", nargs="*", default=list(FLOORS),
-                    choices=list(FLOORS), help="which floors to run")
-    ap.add_argument("--axes", nargs="*", default=AXES, choices=AXES,
-                    help="which axes to run")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help="hw1 config yaml (loaded via simulator.load_config)")
     ap.add_argument("--version", default="open3d", choices=("open3d", "my_icp"),
                     help="ICP backend for scoring")
     ap.add_argument("--fps", type=float, default=30.0,
-                    help="replay fps (flicker time base; keep fixed for repro)")
+                    help="nominal replay fps: time base t = i/fps for both the "
+                         "replay and the seconds->frame window mapping")
     ap.add_argument("--no-collect", action="store_true",
-                    help="skip replay; rescore whatever is already under eval/_data")
-    ap.add_argument("--data-root", default="eval/_data",
-                    help="root for per-(floor,axis) captures")
-    ap.add_argument("--out-dir", default="eval", help="where results.csv + radars go")
+                    help="skip the two sim runs; rescore existing captures")
+    ap.add_argument("--data-root", default=None,
+                    help="override <output.root> (dir holding baseline/ and "
+                         "mixed/); with --no-collect the config is not read and "
+                         "the simulator package is never imported")
+    ap.add_argument("--out-dir", default="eval",
+                    help="where results.csv / per_window.csv go")
     args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    if args.no_collect and args.data_root:
+        root = _abspath(args.data_root)          # fully sim-free rescore path
+    else:
+        from simulator import load_config
+        config = load_config(_abspath(args.config))
+        if args.data_root:
+            config["output"]["root"] = args.data_root
+        root = _abspath(config["output"]["root"])
+        if not args.no_collect:
+            collect(config, args.fps)
+
+    out_dir = _abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    base_root = os.path.join(root, "baseline")
+    mixed_root = os.path.join(root, "mixed")
+
+    # Whole-floor GT reference for the coverage/F-score — from baseline/ ONLY
+    # (completeness.build_gt_reference refuses a mixed/ dir).
+    if not os.path.isdir(os.path.join(base_root, "rgb")):
+        raise FileNotFoundError(
+            f"no baseline capture at {base_root} — run evaluate.py without "
+            "--no-collect first")
+    print(f"[gt-ref] building whole-floor reference from {base_root} ...")
+    gt_ref = completeness.build_gt_reference(base_root)
+    print(f"[gt-ref] {len(gt_ref.points)} points")
+
     results = {}
-    fresults = {}
+    for cond, dr in (("baseline", base_root), ("mixed", mixed_root)):
+        errs, fs = score_condition(dr, args.version, gt_ref)
+        l2 = float("inf") if errs is None else float(np.mean(errs))
+        results[cond] = {"errs": errs, "l2": l2, "fs": fs}
+        print(f"[score] {cond}: mean L2 = {l2:.4f} m"
+              + ("" if fs is None else
+                 f" | F@{completeness.PRIMARY_TAU} = "
+                 f"{fs[completeness.PRIMARY_TAU]['f']:.3f}"))
 
-    for floor in args.floors:
-        spec = FLOORS[floor]
-        traj = os.path.join(REPO, spec["traj"])
-        if not os.path.exists(traj):
-            print(f"[skip] {floor}: missing trajectory {spec['traj']}")
-            continue
-        results[floor] = {}
-        fresults[floor] = {}
+    windows = load_windows(mixed_root)
+    rows, _ = per_window_rows(windows, results["mixed"]["errs"],
+                              results["baseline"]["errs"], args.fps)
 
-        # Whole-floor GT reference (for the coverage/F-score) is built from the
-        # floor's BASELINE capture. Ensure it exists, then build it up-front so it
-        # is available while scoring every axis (including baseline itself).
-        base_root = os.path.join(REPO, args.data_root, floor, "baseline")
-        collected = set()
-        if not args.no_collect and "baseline" in spec["configs"]:
-            collect(spec["configs"]["baseline"], traj, base_root, args.fps)
-            collected.add("baseline")
-        gt_ref = None
-        if os.path.isdir(os.path.join(base_root, "rgb")):
-            print(f"  [gt-ref] building whole-floor reference from {floor}/baseline ...")
-            gt_ref = completeness.build_gt_reference(base_root)
-            print(f"  [gt-ref] {len(gt_ref.points)} points")
-        else:
-            print(f"  [gt-ref] no baseline capture for {floor}; F-score skipped")
-
-        for axis in args.axes:
-            out_root = os.path.join(REPO, args.data_root, floor, axis)
-            if not args.no_collect and axis not in collected:
-                collect(spec["configs"][axis], traj, out_root, args.fps)
-            if not os.path.isdir(os.path.join(out_root, "rgb")):
-                print(f"  [skip] {floor}/{axis}: no capture at {out_root}")
-                continue
-            l2, fs = score(out_root, args.version, gt_ref)
-            results[floor][axis] = l2
-            if fs is not None:
-                fresults[floor][axis] = fs
-                s = fs[completeness.PRIMARY_TAU]
-                print(f"  [score] {floor}/{axis}: mean L2 = {l2:.4f} m | "
-                      f"F@{completeness.PRIMARY_TAU} = {s['f']:.3f} "
-                      f"(acc {s['accuracy']:.3f}, comp {s['completeness']:.3f})")
-            else:
-                print(f"  [score] {floor}/{axis}: mean L2 = {l2:.4f} m")
-
-    write_csv(results, os.path.join(args.out_dir, "results.csv"))
-    write_fscore_csv(fresults, os.path.join(args.out_dir, "fscore.csv"))
-    for floor in args.floors:
-        if results.get(floor):
-            radar(floor, results[floor],
-                  os.path.join(args.out_dir, f"radar_{floor.replace('_floor','floor')}.png"))
-
-    # console summary tables
-    print("\n=== mean L2 (m)  [lower = better trajectory] ===")
-    print("floor".ljust(14) + "".join(a.ljust(15) for a in AXES))
-    for floor in args.floors:
-        if results.get(floor):
-            row = results[floor]
-            print(floor.ljust(14) + "".join(
-                (f"{row.get(a, float('nan')):.4f}").ljust(15) for a in AXES))
-
-    tau = completeness.PRIMARY_TAU
-    print(f"\n=== F-score @ tau={tau} m  [higher = better; couples accuracy + coverage] ===")
-    print("floor".ljust(14) + "".join(a.ljust(15) for a in AXES))
-    for floor in args.floors:
-        row = fresults.get(floor)
-        if row:
-            print(floor.ljust(14) + "".join(
-                (f"{row[a][tau]['f']:.3f}" if a in row else "n/a").ljust(15)
-                for a in AXES))
+    write_results_csv(results, os.path.join(out_dir, "results.csv"))
+    write_per_window_csv(rows, os.path.join(out_dir, "per_window.csv"))
+    print_tables(results, rows)
 
 
 if __name__ == "__main__":
