@@ -38,9 +38,3 @@ flips the habitat-sim-mutex to the bullet-enabled build, exactly like
 
 **habitat-lab.** Installed editable from the submodule, pinned at tag v0.3.3 to
 match habitat-sim 0.3.3.
-
-## isaaclab
-
-The `isaaclab` stack still lives in the Docker flow (see `Makefile` /
-`Dockerfile`); a second `[feature.isaaclab]` can be added to `pixi.toml` later
-without disturbing the habitat env.

@@ -15,15 +15,20 @@ withbullet = { version = "*", channel = "aihabitat" }
 gdown = "*"
 pygame = "*"
 pyyaml = "*"
+rdflib = "*"
+pytest = "*"
+openjdk = "21.*"
 
 [feature.habitat.pypi-dependencies]
 habitat-lab = { path = "dependencies/habitat-lab/habitat-lab", editable = true }
+simulator = { path = "packages/simulator", editable = true }
 opencv-python = "==4.8.0.76"
 open3d = "*"
 
 [feature.habitat.tasks]
 smoke = { cmd = "python -c \"import habitat_sim, habitat; print('habitat-sim', habitat_sim.__version__); print('habitat-lab', habitat.__version__); print('bullet build:', habitat_sim.built_with_bullet)\"" }
 fetch-replica = { cmd = "mkdir -p replica_v1 && gdown https://drive.google.com/uc?id=1zHA2AYRtJOmlRaHNuXOvC_OaVxHe56M4 -O replica_v1/apartment_0.zip && unzip -o replica_v1/apartment_0.zip -d replica_v1 && rm replica_v1/apartment_0.zip" }
+test = { cmd = "pytest hw1/test_e2e.py -v" }   # ontology regression only; simulator suite: pytest packages/simulator/tests/
 
 [environments]
 habitat = { features = ["habitat"], solve-group = "habitat" }

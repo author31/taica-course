@@ -1,16 +1,20 @@
 """
 Geometry-only ICP SLAM utilities for the HW1 robustness/generalization eval.
 
-Split out of the original scripts/reconstruct.py so the reconstruction pipeline
+Split out of the original reconstruction script so the reconstruction pipeline
 can be driven headless (no Open3D window) from the evaluator, while the thin
 hw1/reconstruct.py CLI still imports these for interactive visualisation.
 
-PIPELINE (geometry-only, by design)
-    Per consecutive frame pair: FPFH RANSAC global registration -> point-to-plane
-    ICP refinement. NO colour is used in registration. Lighting perturbation
-    therefore reaches the geometry ONLY through the depth sensor's ambient-light
-    coupling (see load.apply_depth_sensor): brighter/darker exposure raises depth
-    noise / dropout / range loss, which moves the reconstruction metric.
+GEOMETRY ONLY, BY DESIGN
+    NO colour is used in registration, anywhere. Lighting perturbation therefore
+    reaches the geometry ONLY through the depth sensor's ambient-light coupling
+    (see load.apply_depth_sensor): brighter/darker exposure raises depth noise /
+    dropout / range loss, which moves the reconstruction metric.
+
+    Keep it that way. RGB is a declared *proxy* in this assignment, not a cause —
+    if colour leaked into registration, the causal chain being measured would stop
+    being the one being claimed, and every conclusion drawn downstream would be
+    unsupported.
 
 DEPTH FORMAT
     load_depth_meters auto-detects the on-disk depth encoding:
@@ -25,9 +29,15 @@ KEY EXPORTS
     global_registration, local_icp_algorithm, my_local_icp_algorithm,
     remove_ceiling, make_trajectory,
     reconstruct(data_root, version="open3d") -> (pcd, pred_cam_pos, gt_poses),
-    mean_l2(pred_cam_pos, gt_poses) -> float
+    reconstruct(..., return_diagnostics=True)
+        -> (pcd, pred_cam_pos, gt_poses, diagnostics),
+    mean_l2(pred_cam_pos, gt_poses) -> float,
+    pred_positions_frame0 / gt_positions_frame0 — the frame reconciliation
+        mean_l2 scores in, exposed so the visualiser can draw the same frame
+        instead of reimplementing it
 """
 
+import json
 import numpy as np
 import open3d as o3d
 import os
@@ -35,19 +45,30 @@ import time
 import cv2
 import copy
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Camera Intrinsics
-#   Pinhole camera · Resolution 512*512 · FOV 90° (H and V)
-#   fx = fy = (W/2) / tan(FOV/2) = 256 / tan(45°) = 256
-#   cx = cy = 256
-#   depth_scale = 1000  →  Z_meters = raw_depth / 1000
+# Camera intrinsics — PER CAPTURE, never hardcoded here.
+#
+#   Every capture directory ships its own `intrinsics.json` next to rgb/, depth/
+#   and GT_pose.npy, carrying exactly three keys:
+#
+#       {"width": <px>, "height": <px>, "hfov": <degrees>}
+#
+#   Read them from the capture you are reconstructing and pass them in. Two
+#   different floors, resolutions or fields of view must not be able to end up
+#   unprojected through the same baked-in constants — that failure is silent and
+#   produces a plausible-looking, wrong reconstruction.
+#
+#   Depth ENCODING is a separate thing and is not per capture: it is fixed by the
+#   on-disk format and handled by load_depth_meters.
 # ──────────────────────────────────────────────────────────────────────────────
-IMG_W, IMG_H = 512, 512
-FOV_DEG      = 90.0
-fx = fy      = (IMG_W / 2.0) / np.tan(np.radians(FOV_DEG / 2.0))   # 256.0
-cx, cy       = IMG_W / 2.0, IMG_H / 2.0                              # 256.0
-DEPTH_SCALE  = 1000.0
+DEPTH_SCALE  = 1000.0     # uint16 depth PNGs store millimetres
+
+# Image axes (+X right, +Y down, +Z forward — what depth_image_to_point_cloud and
+# reconstruct produce) -> the GT sensor's OpenGL axes (+X right, +Y up, +Z back).
+# A 180 deg rotation about X: proper (det = +1), so distances and handedness hold.
+CAM_TO_GT_AXES = np.diag([1.0, -1.0, -1.0])
 
 
 def load_depth_meters(depth_path):
@@ -62,7 +83,8 @@ def load_depth_meters(depth_path):
             * anything else (uint8 vis) -> Habitat 8-bit vis: value / 255.0 * 10.0.
         Return a float64 H*W array (or None on read failure).
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     d = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if d is None:
@@ -74,59 +96,102 @@ def load_depth_meters(depth_path):
     return d.astype(np.float64) / 255.0 * 10.0             # 8-bit vis → m
 
 
-def depth_image_to_point_cloud(rgb, depth_m):
+def depth_image_to_point_cloud(rgb, depth_m, width, height, hfov, keep_mask=None):
     """
-    Convert an RGB image and a depth map (metres, float) into a colored 3-D point
-    cloud using the pinhole camera model. No Open3D projection utilities are used.
+    Back-project one RGB-D frame into a colored 3-D point cloud.
 
-    Args:
-        rgb     : H*W*3 uint8 BGR image (as loaded by cv2).
-        depth_m : H*W float array, depth in METRES (see load_depth_meters).
+    CONTRACT
+        Inputs
+            rgb     : H*W*3 uint8, channels in **BGR** order (cv2.imread order).
+            depth_m : H*W float array, depth in **METRES** (see load_depth_meters).
+                      Both arrays describe the same frame and share H and W.
+            width   : int, PIXELS   — sensor width  from the capture's intrinsics.
+            height  : int, PIXELS   — sensor height from the capture's intrinsics.
+            hfov    : float, DEGREES — horizontal field of view, ditto.
+                      These three are the capture's camera parameters and they are
+                      ORDINARY ARGUMENTS: the caller reads them from the
+                      `intrinsics.json` sitting in the capture directory being
+                      reconstructed and passes them down. This function opens no
+                      files, reads no config, and assumes no resolution or FOV.
+                      The provided phase-1 capture and anything collected in phase 2
+                      each carry their own, so the same code path serves both floors
+                      and cannot unproject one floor's depth through another
+                      floor's camera.
 
-    Returns:
-        o3d.geometry.PointCloud with XYZ positions and RGB colors.
+        Output
+            o3d.geometry.PointCloud carrying BOTH `.points` and `.colors`:
+              points : (N,3) float64, **metres**, in this frame's CAMERA frame —
+                       +X right, +Y down, +Z forward into the scene (image axes).
+              colors : (N,3) float in [0,1], **RGB** order (i.e. the channel order
+                       is reversed relative to the `rgb` argument).
 
-    SPEC:
-        Back-project every valid pixel through the module-level pinhole intrinsics
-        (fx, fy, cx, cy) with NO Open3D projection helpers.
-        - Validity: keep only pixels with depth_m > 0.
-        - For each kept pixel (u, v) with depth Z = depth_m[v, u]:
-              X = (u - cx) * Z / fx
-              Y = (v - cy) * Z / fy
-              Z = Z
-          Camera frame: +Z forward (into scene), +X right, +Y down (image order).
-        - Colors: BGR uint8 -> RGB float in [0, 1] (divide by 255, reverse channels).
-        - Return an o3d.geometry.PointCloud carrying both points (N*3) and colors,
-          one point per valid pixel, in row-major pixel order.
-        WIKI: https://en.wikipedia.org/wiki/Pinhole_camera_model
+        Validity
+            A pixel contributes a point iff `depth_m > 0`. Zero (and any negative)
+            depth means "no return" and is dropped — depth dropout is one of the
+            failure modes this assignment measures, so it must not become a point
+            at the origin.
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+        Invariants
+            * (height, width) == depth_m.shape == rgb.shape[:2]. The intrinsics
+              describe THIS image; a mismatch is a caller bug, not something to
+              paper over by falling back on the array shape.
+            * len(points) == len(colors) == number of valid pixels.
+            * Every returned point has z > 0 (a point with z <= 0 means the
+              validity mask was not applied).
+            * Points appear in row-major pixel order (row 0 left-to-right first).
+            * N == 0 is legal: an all-invalid depth map yields an EMPTY cloud, not
+              an exception.
+            * Pure: `rgb` and `depth_m` must not be modified.
+
+        Geometry
+            A pinhole camera with square pixels, no skew and no distortion; the
+            principal point is the image centre. The focal length in pixels follows
+            from `width` and `hfov` alone, and the vertical focal length equals the
+            horizontal one — so (width, height, hfov) fully determines the model.
+            Do the projection yourself: Open3D's projection helpers
+            (create_from_depth_image / create_from_rgbd_image,
+            PinholeCameraIntrinsic, ...) are OFF-LIMITS here — the mapping from
+            (u, v, depth) to (X, Y, Z) is the thing being learned.
+            Reference: https://en.wikipedia.org/wiki/Pinhole_camera_model
+
+        Smoke fixture: hw1/tests/fixtures/ ships five synthetic frames whose exact
+        clouds are known. `expected.json -> cloud_stats` gives the point count,
+        AABB and centroid of each full cloud, and `clouds.npz` holds the clouds
+        themselves for a point-for-point comparison — so you can check this
+        function on its own, before touching reconstruct(). See the README there.
     """
     h, w = depth_m.shape
+    if (height, width) != (h, w):
+        raise ValueError(
+            f"intrinsics ({width}x{height}) do not match the frame ({w}x{h}) — "
+            "intrinsics.json belongs to a different capture")
 
-    # ── Validity mask ────────────────────────────────────────────────────────
+    # Validity mask: raw 0 (and anything negative) is the sensor's "no return",
+    # not a 0 m reading, so it must not become a point at the camera origin.
     valid = depth_m > 0
+    if keep_mask is not None:
+        keep = np.asarray(keep_mask, dtype=bool)
+        if keep.shape != depth_m.shape:
+            raise ValueError(
+                f"keep_mask shape {keep.shape} does not match depth {depth_m.shape}")
+        valid &= keep
     Z = depth_m[valid].astype(np.float64)
     rgb_v = rgb[valid]
 
-    # ── Pixel grids ──────────────────────────────────────────────────────────
+    # Pinhole, square pixels, no skew/distortion, principal point at the centre.
+    # fx == fy, so (width, height, hfov) fully determines the model.
+    fx = fy = (width / 2.0) / np.tan(np.radians(hfov / 2.0))
+    cx, cy = width / 2.0, height / 2.0
+
+    # Row-major pixel order falls out of the boolean mask over the meshgrid.
     u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
-    u_v = u_grid[valid]
-    v_v = v_grid[valid]
-
-    # ── Back-projection  (pinhole inverse) ──────────────────────────────────
-    X = (u_v - cx) * Z / fx
-    Y = (v_v - cy) * Z / fy
-
-    points = np.column_stack([X, Y, Z])                     # N * 3
-
-    # ── Colors (BGR → RGB, normalised) ─────────────────────────────────────
-    colors = rgb_v.astype(np.float64) / 255.0
-    colors = colors[:, ::-1]                                # BGR → RGB
+    X = (u_grid[valid] - cx) * Z / fx
+    Y = (v_grid[valid] - cy) * Z / fy
 
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
+    pcd.points = o3d.utility.Vector3dVector(np.column_stack([X, Y, Z]))
+    pcd.colors = o3d.utility.Vector3dVector(
+        rgb_v.astype(np.float64)[:, ::-1] / 255.0)          # BGR -> RGB, [0,1]
     return pcd
 
 
@@ -149,7 +214,8 @@ def preprocess_point_cloud(pcd, voxel_size):
         Return (pcd_down, fpfh). The feature radius must exceed the normal radius.
         WIKI: https://en.wikipedia.org/wiki/Point_Feature_Histograms
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     pcd_down = pcd.voxel_down_sample(voxel_size)
 
@@ -189,7 +255,8 @@ def global_registration(source_down, target_down, source_fpfh,
         reconstruct() `robust` note.)
         WIKI: https://en.wikipedia.org/wiki/Random_sample_consensus
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     dist_thr = voxel_size * 1.5
 
@@ -236,7 +303,8 @@ def local_icp_algorithm(source_down, target_down, trans_init, threshold):
         Return the RegistrationResult (`.transformation` is the refined 4*4).
         WIKI: https://en.wikipedia.org/wiki/Iterative_closest_point
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     # Guarantee normals exist on both clouds
     for pcd in (source_down, target_down):
@@ -272,7 +340,8 @@ def multiscale_icp(source_down, target_down, trans_init,
         same attribute an Open3D RegistrationResult exposes, so callers are uniform.
         WIKI: https://en.wikipedia.org/wiki/Iterative_closest_point
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     for pcd in (source_down, target_down):
         if not pcd.has_normals():
@@ -386,193 +455,488 @@ def _rot_angle_deg(R):
     return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
 
 
+def _read_intrinsics(capture_root):
+    """Return (width, height, hfov_deg) from <capture_root>/intrinsics.json.
+
+    Every capture ships its own camera parameters next to GT_pose.npy, so a
+    capture is always unprojected through the camera that recorded it. There is
+    deliberately NO fallback default: a silently wrong camera produces a
+    plausible-looking, wrong reconstruction, which is worse than a crash.
+    """
+    path = os.path.join(capture_root, 'intrinsics.json')
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"missing camera intrinsics: {path!r}\n"
+            "Every capture directory must ship intrinsics.json "
+            '({"width", "height", "hfov"}) alongside rgb/ and depth/. It is NOT '
+            "defaulted — a guessed camera yields a wrong reconstruction.")
+    with open(path) as f:
+        data = json.load(f)
+    missing = [k for k in ("width", "height", "hfov") if k not in data]
+    if missing:
+        raise ValueError(
+            f"{path!r} is missing required key(s) {missing}; it must hold exactly "
+            '{"width": int, "height": int, "hfov": float (DEGREES)}')
+    return int(data["width"]), int(data["height"]), float(data["hfov"])
+
+
+def _frame_paths(data_root, frames):
+    """[(rgb_path, depth_path), ...] in the order the pipeline will consume them.
+
+    frames=None  -> every stem present under BOTH rgb/ and depth/, ascending
+                    (n = min(#rgb, #depth), the whole-batch default).
+    frames=[...] -> exactly those stems, IN THE GIVEN ORDER — "consecutive"
+                    downstream means consecutive in the SUBSET (see SUBSETTING).
+    """
+    rgb_dir = os.path.join(data_root, 'rgb')
+    depth_dir = os.path.join(data_root, 'depth')
+    if frames is None:
+        rgb_files = _sorted_frames(rgb_dir)
+        depth_files = _sorted_frames(depth_dir)
+        n = min(len(rgb_files), len(depth_files))
+        return [(os.path.join(rgb_dir, rgb_files[i]),
+                 os.path.join(depth_dir, depth_files[i])) for i in range(n)]
+    return [(os.path.join(rgb_dir, f"{int(s)}.png"),
+             os.path.join(depth_dir, f"{int(s)}.png")) for s in frames]
+
+
+def _mask_index(mask_root):
+    """Index one exported factor-mask directory by incident frame stem."""
+    if mask_root is None:
+        return {}
+    if not os.path.isdir(mask_root):
+        raise FileNotFoundError(f"mask directory does not exist: {mask_root!r}")
+    index = {}
+    for name in os.listdir(mask_root):
+        if not name.lower().endswith(".png"):
+            continue
+        stem = os.path.splitext(name)[0]
+        parts = stem.split("_")
+        try:
+            incident = [int(parts[0])] if len(parts) == 1 else [int(parts[0]), int(parts[1])]
+        except (ValueError, IndexError):
+            continue
+        path = os.path.join(mask_root, name)
+        for frame in incident:
+            index.setdefault(frame, []).append(path)
+    return index
+
+
+def _keep_mask_for_frame(mask_index, stem, shape):
+    """Conjoin all frame/pair drop masks incident on ``stem`` into one keep mask."""
+    paths = mask_index.get(int(stem), ())
+    if not paths:
+        return None
+    drop = np.zeros(shape, dtype=bool)
+    for path in paths:
+        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError(f"could not read exported mask {path!r}")
+        if image.ndim == 3:
+            image = image[:, :, 0]
+        if image.shape != shape:
+            raise ValueError(
+                f"mask {path!r} shape {image.shape} does not match depth {shape}")
+        drop |= image != 0
+    return ~drop
+
+
 def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
                 build_cloud=True, robust=True, gate_trans=0.5, gate_rot=30.0,
-                down_voxel=None):
+                down_voxel=None, frames=None, return_diagnostics=False,
+                mask_root=None, prior_warp_depth_gate=0.10,
+                collect_prior_warp=False):
     """
-    Geometry-only ICP SLAM over the frames under `data_root`.
+    Geometry-only ICP SLAM over the frames under `data_root`: estimate the camera
+    trajectory (and optionally a global map) by chaining pairwise registrations of
+    consecutive frames.
 
-    Steps:
-      1. Load RGB + depth frames (depth via load_depth_meters).
-      2. Unproject each depth frame → local point cloud.
-      3. Pairwise registration (RANSAC + point-to-plane ICP) between consecutive
-         frames; chain the relative transforms into a global trajectory.
-      4. Accumulate all clouds into one global map.
-      5. Load ground-truth poses from data_root/GT_pose.npy.
+    CONTRACT
 
-    Args:
-        data_root : dir containing rgb/, depth/, GT_pose.npy.
-        version   : "open3d" (point-to-plane ICP) or "my_icp" (custom SVD ICP).
-        build_cloud : accumulate the full global map (default). Pass False in the
-                      eval path — only the trajectory is scored, and the map runs
-                      to ~10^8 points, which is slow and memory-heavy to build.
-        robust    : DEFAULT. Consecutive frames are registered by point-to-plane
-                    ICP initialised from a CONSTANT-VELOCITY prior (previous
-                    relative transform), with NO FPFH RANSAC. A physical gate
-                    rejects any relative transform whose translation/rotation is
-                    implausible for one step (> gate_trans m / gate_rot deg) and
-                    coasts on the prior instead. This is what makes the pipeline
-                    stable AND reproducible: FPFH RANSAC on Replica's rotationally
-                    symmetric geometry returns spurious ~10^1 m alignments (one bad
-                    pair derails the whole trajectory), and its RNG is not covered
-                    by seed → non-deterministic scores. Still geometry-only, so
-                    lighting reaches the metric ONLY through the depth sensor.
-                    robust=False restores the raw FPFH-RANSAC + ICP chain (the
-                    fragile student-template pipeline) for comparison.
-        gate_trans/gate_rot : per-step plausibility gate (m / deg). GT steps here
-                    are ~0.09 m / ~6 deg, so 0.5 m / 30 deg is generous headroom.
-        down_voxel : if set (and build_cloud), voxel-downsample each frame's world
-                    cloud before accumulating so the global map stays small (the
-                    coverage/F-score eval needs the cloud, not the full ~10^8 pts).
+    Dataset layout
+        data_root/rgb/<stem>.png     8-bit colour, one per frame
+        data_root/depth/<stem>.png   depth, encoding handled by load_depth_meters
+        data_root/GT_pose.npy        optional (M,7) ground-truth pose array
+        data_root/intrinsics.json    {"width", "height", "hfov"} for THIS capture
+        `<stem>` is an integer. An rgb file and a depth file with the same stem are
+        the same frame. Default frame ORDER is ascending integer stem.
 
-    Returns:
+        The intrinsics belong to the capture, not to this file: read them from
+        `data_root/intrinsics.json` here and pass them into
+        depth_image_to_point_cloud. Never hardcode them, and never take them from a
+        config — a capture must be reconstructable from its own directory alone.
+
+    Inputs
+        data_root  : str — the directory above.
+        version    : str — which pairwise-registration backend to use. "open3d"
+                     (default) selects the Open3D point-to-plane wrapper that ships
+                     working in this file; it is the reference baseline any other
+                     backend is compared against. The choice of backend does not
+                     change anything else in this contract.
+        voxel_size : float, METRES — the resolution clouds are reduced to before
+                     registration. Affects accuracy and runtime, not the contract.
+        verbose    : bool — progress printing only. Must NOT change the return value.
+        build_cloud: bool — when True (default) the accumulated global map is built
+                     and returned; when False the map is skipped and an EMPTY
+                     PointCloud is returned instead. `pred_cam_pos` and `gt_poses`
+                     are identical either way. The evaluator passes False because
+                     only the trajectory is scored and the full map reaches ~1e8
+                     points.
+        robust     : bool, default True. Two guarantees are attached to True, and
+                     they are the reason it is the default:
+                       (1) DETERMINISM — two runs over the same data return the
+                           same `pred_cam_pos`. No uncovered RNG anywhere in the
+                           path. A score that moves between runs is not a score.
+                       (2) The per-step gate below is enforced.
+                     robust=False selects the plain feature-matching-then-ICP chain
+                     and carries neither guarantee; it exists so the two can be
+                     compared.
+        gate_trans : float, METRES  — per-step plausibility bound on translation.
+        gate_rot   : float, DEGREES — per-step plausibility bound on the geodesic
+                     rotation angle. Both apply only when robust=True, where the
+                     invariant is: EVERY relative transform actually applied to the
+                     trajectory satisfies ||t|| <= gate_trans and angle <= gate_rot.
+                     A single implausible pair must not be allowed to derail the
+                     whole trajectory. Defaults (0.5 m / 30 deg) are generous
+                     headroom over the ~0.09 m / ~6 deg per-step motion of the
+                     provided captures.
+        down_voxel : float or None, METRES — when set AND build_cloud, each frame's
+                     cloud is reduced to this resolution before being merged into
+                     the global map, so the map stays a workable size. Affects the
+                     returned map only, never `pred_cam_pos`.
+        frames     : optional list of integer frame stems — see SUBSETTING below.
+        return_diagnostics : bool — preserve the ordinary three-value return by
+                     default.  When True, append a dict containing `gated_steps`
+                     and `gated_frames`.  This is run evidence for the experiment
+                     inspector; it does not change registration or scoring.
+
+    Returns
         (global_pcd, pred_cam_pos, gt_poses)
-          global_pcd   : o3d.geometry.PointCloud — accumulated global map.
-          pred_cam_pos : (N,3) float64 — estimated camera centres in the frame-0
-                         camera frame (RAW; mean_l2 handles axis reconciliation).
-          gt_poses     : (M,7) float — GT [x,y,z,qw,qx,qy,qz], or None if absent.
+          global_pcd   : o3d.geometry.PointCloud — every frame's cloud expressed in
+                         the FRAME-0 CAMERA frame and merged. Empty when
+                         build_cloud=False.
+          pred_cam_pos : (N,3) float64, METRES — estimated camera centres, also in
+                         the FRAME-0 CAMERA frame (+X right, +Y down, +Z forward).
+                         RAW: do not rotate, scale or align to the GT here —
+                         mean_l2 owns the frame reconciliation, and doing it twice
+                         is the classic way to produce a wrong score that looks
+                         plausible.
+          gt_poses     : (M,7) float — [x, y, z, qw, qx, qy, qz] as stored on disk,
+                         or None when GT_pose.npy is absent (a capture with no GT
+                         must still reconstruct).
 
-    SPEC:
-        Build a per-frame trajectory (and optionally a global map) by chaining
-        pairwise rigid registrations, GEOMETRY ONLY (colour never enters registration).
-        - Frames: numeric-sorted .png pairs from data_root/rgb and data_root/depth;
-          n_frames = min(len(rgb), len(depth)); depth via load_depth_meters; skip a
-          frame whose RGB or depth fails to load. If no cloud loads, return an empty
-          map, zeros((0,3)), and the GT.
-        - Unproject each frame to a local cloud (depth_image_to_point_cloud).
-        - Frame 0 anchors the world: T_global[0] = identity, pred_cam_pos[0] = 0.
-        - For each i>=1, register source=frame i onto target=frame i-1 (both
-          voxel-downsampled at `voxel_size`) to get a relative transform T_rel:
-            * robust=True (default): init T_rel from the constant-velocity prior
-              (previous T_rel), NO FPFH RANSAC; refine with multiscale_icp when
-              version=="open3d" (else my_local_icp_algorithm). Then a PHYSICAL GATE:
-              if ||T_rel translation|| > gate_trans OR geodesic rotation angle >
-              gate_rot, discard T_rel and coast on the prior (count as gated).
-            * robust=False: init from global_registration (FPFH RANSAC) then a
-              single-threshold local_icp_algorithm (icp_thr = voxel_size*1.5) —
-              the fragile, non-deterministic student-template chain.
-          version=="my_icp" uses my_local_icp_algorithm in both paths.
-        - Accumulate: T_i = T_global[i-1] @ T_rel; append T_i and its translation
-          T_i[:3,3] as the camera centre. If build_cloud, deep-copy frame i, apply
-          T_i, optionally voxel-downsample at down_voxel, and add into the map.
-        - GT: load data_root/GT_pose.npy (None if absent).
-        Determinism: the robust path has no uncovered RNG, so scores reproduce.
-        Return (global_pcd, pred_cam_pos as (N,3) float64, gt_poses).
-        WIKI: https://en.wikipedia.org/wiki/Simultaneous_localization_and_mapping
+    Invariants
+        * Frame 0 anchors the world: pred_cam_pos[0] == (0, 0, 0) exactly.
+        * len(pred_cam_pos) == the number of frames actually used. A frame whose
+          rgb or depth fails to load is skipped, not faked.
+        * No frames loadable  -> (empty PointCloud, zeros((0,3)), gt_poses). Not an
+          exception.
+        * GEOMETRY ONLY (D1). Colour must never enter registration — it is carried
+          on the clouds for visualisation and nothing else. This is what makes the
+          whole assignment legible: lighting reaches the score ONLY through the
+          depth sensor's light coupling, so if colour leaked into registration the
+          causal chain being measured would no longer be the one being claimed.
+        * `data_root` is read-only; nothing is written.
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SUBSETTING (the `frames` argument / the --experiment path)
+        hw1/reconstruct.py --experiment cuts contiguous USABLE-LINK segments from
+        the Pass/Fail statuses baked into an experiment Turtle (a link is usable
+        iff the pair passed and both its endpoint frames passed — §4.5),
+        turns each frame IRI into its integer stem and passes those stems
+        here as `frames`. Its baseline run passes frames=None, i.e. whole batch.
+          * frames=None (default): use every frame present under rgb/ and depth/,
+            in ascending stem order — n = min(#rgb, #depth).
+          * frames=[...]: use ONLY those stems, IN THE GIVEN ORDER, resolved as
+            data_root/rgb/<stem>.png and data_root/depth/<stem>.png. The entire
+            pipeline runs over that reduced sequence — "consecutive" means
+            consecutive IN THE SUBSET, not in the original capture.
+          * GT is subset by the SAME stems, so gt_poses[i] corresponds to
+            pred_cam_pos[i] and mean_l2 stays meaningful. (_load_gt does this.)
+          * Expected consequence, not a bug: dropping interior frames WIDENS the
+            motion between the frames that remain, while the per-step gate above is
+            sized for consecutive frames. A sparse selection therefore scores worse
+            for reasons that have nothing to do with the quality of the frames it
+            kept. This trade-off is the point of phase 1 — a filter that throws away
+            too much is as wrong as one that keeps bad frames. It is also exactly
+            why hw1/reconstruct.py cuts CONTIGUOUS segments instead of filtering
+            frames one by one: a contiguous segment leaves every surviving pair
+            consecutive, so the gate keeps the size it was designed for.
+
+    Reference: https://en.wikipedia.org/wiki/Simultaneous_localization_and_mapping
+
+    Smoke fixture: hw1/tests/fixtures/ ships five synthetic frames with exactly
+    known per-step transforms and a GT trajectory whose perfect mean_l2 is 0.0.
+    Run this function on that directory before running it on real data — it tells
+    "my ICP is wrong" apart from "my loop is wrong". See the README there.
     """
-    rgb_dir   = os.path.join(data_root, 'rgb')
-    depth_dir = os.path.join(data_root, 'depth')
+    # Camera parameters come from the capture being reconstructed, never from a
+    # config and never baked in — two floors/resolutions must not share one model.
+    width, height, hfov = _read_intrinsics(data_root)
+    pairs = _frame_paths(data_root, frames)
+    mask_index = _mask_index(mask_root)
 
-    rgb_files   = _sorted_frames(rgb_dir)
-    depth_files = _sorted_frames(depth_dir)
-    n_frames    = min(len(rgb_files), len(depth_files))
     if verbose:
-        print(f"[reconstruct] {data_root}: {n_frames} frames | version={version}")
+        print(f"[reconstruct] {data_root}: {len(pairs)} frames | version={version} "
+              f"| robust={robust}")
 
-    # ── Load all point clouds ───────────────────────────────────────────────
-    pcds = []
-    for i in range(n_frames):
-        rgb   = cv2.imread(os.path.join(rgb_dir, rgb_files[i]))
-        depth_m = load_depth_meters(os.path.join(depth_dir, depth_files[i]))
+    T_global = np.eye(4)          # frame i -> frame-0 camera frame
+    T_rel_prev = np.eye(4)        # constant-velocity prior (robust path)
+    pred_cam_pos = []
+    global_pcd = o3d.geometry.PointCloud()
+    prev_down = prev_fpfh = None
+    icp_thr = voxel_size * 1.5
+    n_gated = 0
+    gated_frames = []
+    link_diagnostics = []
+    prior_warp_measurements = []
+    previous_stem = None
+    previous_depth_path = None
+
+    # Streamed one frame at a time: only the PREVIOUS frame's downsample has to
+    # stay resident, so a 400-frame capture does not hold 400 full clouds in RAM.
+    for i, (rgb_path, depth_path) in enumerate(pairs):
+        t0 = time.time()
+        rgb = cv2.imread(rgb_path)
+        depth_m = load_depth_meters(depth_path)
         if rgb is None or depth_m is None:
             if verbose:
                 print(f"  Warning: could not load frame {i}, skipping.")
             continue
-        pcds.append(depth_image_to_point_cloud(rgb, depth_m))
 
-    n = len(pcds)
-    if n == 0:
-        return o3d.geometry.PointCloud(), np.zeros((0, 3)), _load_gt(data_root)
+        stem = int(os.path.splitext(os.path.basename(depth_path))[0])
+        keep_mask = _keep_mask_for_frame(mask_index, stem, depth_m.shape)
+        pcd = depth_image_to_point_cloud(
+            rgb, depth_m, width, height, hfov, keep_mask=keep_mask)
+        cur_down, cur_fpfh = preprocess_point_cloud(pcd, voxel_size)
 
-    # ── Sequential pairwise registration ────────────────────────────────────
-    def _maybe_down(p):
-        return p.voxel_down_sample(down_voxel) if down_voxel else p
-
-    T_global     = [np.eye(4)]
-    all_pcds     = [_maybe_down(pcds[0])] if build_cloud else None
-    pred_cam_pos = [np.zeros(3)]
-    T_rel_prev   = np.eye(4)          # constant-velocity prior (robust path)
-    icp_thr      = voxel_size * 1.5
-    n_gated      = 0
-
-    for i in range(1, n):
-        t0 = time.time()
-        source = pcds[i]
-        target = pcds[i - 1]
-
-        src_down, _ = preprocess_point_cloud(source, voxel_size)
-        tgt_down, _ = preprocess_point_cloud(target, voxel_size)
-
-        if robust:
-            trans_init = T_rel_prev                      # constant-velocity init
-        else:
-            src_down2, src_fpfh = preprocess_point_cloud(source, voxel_size)
-            tgt_down2, tgt_fpfh = preprocess_point_cloud(target, voxel_size)
-            trans_init = global_registration(
-                src_down2, tgt_down2, src_fpfh, tgt_fpfh, voxel_size).transformation
-
-        if version == 'open3d':
-            # Coarse-to-fine in the robust path (wide capture from the CV prior);
-            # single tight-threshold ICP in the raw path for template fidelity.
+        if prev_down is not None:
             if robust:
-                result_icp = multiscale_icp(src_down, tgt_down, trans_init)
+                trans_init = T_rel_prev                  # constant-velocity init
             else:
-                result_icp = local_icp_algorithm(
-                    src_down, tgt_down, trans_init, icp_thr)
-        else:   # my_icp
-            result_icp = my_local_icp_algorithm(
-                src_down, tgt_down, trans_init, voxel_size)
-        T_rel = result_icp.transformation
+                trans_init = global_registration(
+                    cur_down, prev_down, cur_fpfh, prev_fpfh,
+                    voxel_size).transformation
 
-        # Physical gate: reject an implausible one-step jump and coast on the
-        # constant-velocity prior. This is what kills the RANSAC-symmetry
-        # derailment (spurious ~10^1 m / large-angle pairs).
-        if robust and (np.linalg.norm(T_rel[:3, 3]) > gate_trans
-                       or _rot_angle_deg(T_rel) > gate_rot):
-            T_rel = T_rel_prev
-            n_gated += 1
+            if collect_prior_warp:
+                try:
+                    try:
+                        from . import api as factor_api
+                    except ImportError:
+                        import api as factor_api
+                    # The registration prior maps current -> previous.  The
+                    # factor's ordered pair is previous -> current.
+                    value, drop_mask, count = factor_api._prior_warp_depth_residual(
+                        previous_depth_path, depth_path, np.linalg.inv(trans_init),
+                        (width, height, hfov), prior_warp_depth_gate)
+                except Exception:
+                    value, count = float("inf"), 0
+                    drop_mask = np.zeros(depth_m.shape, dtype=np.uint8)
+                prior_warp_measurements.append({
+                    "source": int(previous_stem), "target": int(stem),
+                    "value": float(value), "count": int(count),
+                    "mask": drop_mask})
 
-        T_rel_prev = T_rel
-        T_i = T_global[-1] @ T_rel
-        T_global.append(T_i)
-        pred_cam_pos.append(T_i[:3, 3])
+            if version == 'open3d':
+                # Coarse-to-fine in the robust path (wide capture range from the
+                # CV prior); single tight-threshold ICP in the raw path.
+                if robust:
+                    result_icp = multiscale_icp(cur_down, prev_down, trans_init)
+                else:
+                    result_icp = local_icp_algorithm(
+                        cur_down, prev_down, trans_init, icp_thr)
+            else:   # my_icp
+                result_icp = my_local_icp_algorithm(
+                    cur_down, prev_down, trans_init, voxel_size)
+            T_rel_pre_gate = np.asarray(result_icp.transformation, dtype=np.float64)
+            T_rel = T_rel_pre_gate.copy()
+            proposed_translation = float(np.linalg.norm(T_rel[:3, 3]))
+            proposed_rotation = _rot_angle_deg(T_rel)
+            gate_fired = False
+
+            # Physical gate: an implausible one-step jump is rejected and the
+            # trajectory coasts on the prior instead. One bad pair must not be
+            # able to derail everything downstream of it.
+            if robust and (np.linalg.norm(T_rel[:3, 3]) > gate_trans
+                           or _rot_angle_deg(T_rel) > gate_rot):
+                T_rel = T_rel_prev
+                gate_fired = True
+                n_gated += 1
+                gated_frames.append(int(os.path.splitext(os.path.basename(rgb_path))[0]))
+
+            src_points = np.asarray(cur_down.points, dtype=np.float64)
+            tgt_points = np.asarray(prev_down.points, dtype=np.float64)
+            correspondence_count = 0
+            fitness = 0.0
+            inlier_rmse = float("inf")
+            if len(src_points) and len(tgt_points):
+                transformed = ((T_rel_pre_gate[:3, :3] @ src_points.T).T +
+                               T_rel_pre_gate[:3, 3])
+                distances, _nearest = cKDTree(tgt_points).query(
+                    transformed, k=1, workers=1)
+                inliers = distances < icp_thr
+                correspondence_count = int(np.count_nonzero(inliers))
+                fitness = float(correspondence_count) / float(len(src_points))
+                if correspondence_count:
+                    inlier_rmse = float(np.sqrt(np.mean(distances[inliers] ** 2)))
+
+            link_diagnostics.append({
+                "source": int(previous_stem), "target": int(stem),
+                "prior": np.asarray(trans_init).tolist(),
+                "pre_gate_transform": T_rel_pre_gate.tolist(),
+                "applied_transform": T_rel.tolist(),
+                "gate_fired": bool(gate_fired),
+                "proposed_translation_m": proposed_translation,
+                "proposed_rotation_deg": proposed_rotation,
+                "fitness": fitness,
+                "inlier_rmse_m": inlier_rmse,
+                "correspondence_count": correspondence_count,
+                "rpe_translation_m": None,
+                "rpe_rotation_deg": None,
+                "drift_increment_m": None})
+
+            T_rel_prev = T_rel
+            T_global = T_global @ T_rel
+
+        pred_cam_pos.append(T_global[:3, 3].copy())
 
         if build_cloud:
-            pcd_i_world = copy.deepcopy(pcds[i])
-            pcd_i_world.transform(T_i)
-            all_pcds.append(_maybe_down(pcd_i_world))
+            # down_voxel reduces the MAP only; the trajectory above is untouched.
+            merged = pcd if down_voxel is None else pcd.voxel_down_sample(down_voxel)
+            merged.transform(T_global)
+            global_pcd += merged
 
-        if verbose and (i % 25 == 0 or i == n - 1):
-            print(f"  frame {i:>4d}/{n-1}  dt={time.time()-t0:.2f}s  gated={n_gated}")
+        prev_down, prev_fpfh = cur_down, cur_fpfh
+        previous_stem = stem
+        previous_depth_path = depth_path
 
-    global_pcd = o3d.geometry.PointCloud()
-    if build_cloud:
-        for pcd in all_pcds:
-            global_pcd += pcd
-    pred_cam_pos = np.array(pred_cam_pos, dtype=np.float64)
+        if verbose and (i % 25 == 0 or i == len(pairs) - 1):
+            print(f"  frame {i:>4d}/{len(pairs)-1}  dt={time.time()-t0:.2f}s  "
+                  f"gated={n_gated}")
 
-    return global_pcd, pred_cam_pos, _load_gt(data_root)
+    gt_for_run = _load_gt(data_root, frames)
+    if gt_for_run is not None and link_diagnostics:
+        n_links = min(len(link_diagnostics), max(0, len(gt_for_run) - 1))
+        for k in range(n_links):
+            prev_pose, cur_pose = gt_for_run[k], gt_for_run[k + 1]
+            world_prev = np.eye(4)
+            world_cur = np.eye(4)
+            world_prev[:3, :3] = Rotation.from_quat(
+                [prev_pose[4], prev_pose[5], prev_pose[6], prev_pose[3]]).as_matrix()
+            world_cur[:3, :3] = Rotation.from_quat(
+                [cur_pose[4], cur_pose[5], cur_pose[6], cur_pose[3]]).as_matrix()
+            world_prev[:3, 3] = prev_pose[:3]
+            world_cur[:3, 3] = cur_pose[:3]
+            gt_rel = np.linalg.inv(world_prev) @ world_cur
+            applied = np.asarray(link_diagnostics[k]["applied_transform"])
+            error = np.linalg.inv(gt_rel) @ applied
+            link_diagnostics[k]["rpe_translation_m"] = float(
+                np.linalg.norm(error[:3, 3]))
+            link_diagnostics[k]["rpe_rotation_deg"] = _rot_angle_deg(error)
+
+        pred_arr = np.asarray(pred_cam_pos, dtype=np.float64)
+        pred_eval = pred_positions_frame0(pred_arr)
+        gt_eval = gt_positions_frame0(gt_for_run)
+        n_eval = min(len(pred_eval), len(gt_eval))
+        if n_eval > 1:
+            errors = np.linalg.norm(pred_eval[:n_eval] - gt_eval[:n_eval], axis=1)
+            for k in range(min(len(link_diagnostics), n_eval - 1)):
+                link_diagnostics[k]["drift_increment_m"] = float(
+                    errors[k + 1] - errors[k])
+
+    diagnostics = {"schema_version": 1,
+                   "gated_steps": n_gated,
+                   "gated_frames": gated_frames,
+                   "links": link_diagnostics,
+                   "prior_warp_measurements": prior_warp_measurements}
+    if not pred_cam_pos:
+        result = (o3d.geometry.PointCloud(), np.zeros((0, 3)),
+                  gt_for_run)
+        return (*result, diagnostics) if return_diagnostics else result
+
+    result = (global_pcd,
+              np.array(pred_cam_pos, dtype=np.float64),
+              gt_for_run)
+    return (*result, diagnostics) if return_diagnostics else result
 
 
-def _load_gt(data_root):
-    """Load data_root/GT_pose.npy (the (M,7) GT pose array), or None if absent."""
+def _load_gt(data_root, frames=None):
+    """Load data_root/GT_pose.npy (the (M,7) GT pose array), or None if absent.
+
+    GT rows are in capture order; image stems are identifiers, not guaranteed row
+    numbers.  When `frames` is given, map each requested stem to its ordinal in the
+    sorted common RGB/depth frame list before indexing GT.  This handles both the
+    conventional 0..N-1 capture and datasets such as eval/first_floor whose PNGs
+    are named 1..N.  Stems absent from the capture or beyond GT are skipped while
+    preserving requested order.
+    """
     gt_path = os.path.join(data_root, 'GT_pose.npy')
     if not os.path.exists(gt_path):
         return None
-    return np.load(gt_path)
+    gt = np.load(gt_path)
+    if frames is None:
+        return gt
+    ordered_paths = _frame_paths(data_root, None)
+    stem_to_row = {
+        int(os.path.splitext(os.path.basename(rgb_path))[0]): row
+        for row, (rgb_path, _depth_path) in enumerate(ordered_paths)
+    }
+    rows = [stem_to_row[int(stem)] for stem in frames
+            if int(stem) in stem_to_row and stem_to_row[int(stem)] < len(gt)]
+    return gt[rows]
+
+
+def pred_positions_frame0(pred_cam_pos):
+    """Predicted camera centres re-expressed on the GT sensor's axes (metres).
+
+    `reconstruct` returns centres on IMAGE axes (+X right, +Y down, +Z forward),
+    while Habitat's recorded poses use the OpenGL sensor axes (+X right, +Y up,
+    +Z backward). The two differ by a 180 deg rotation about X — a PROPER rotation
+    (det = +1), not a mirror — so the conversion is a sign flip on Y and Z.
+
+    Both frames are anchored at the frame-0 camera, so the origin is untouched.
+
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
+    """
+    return np.asarray(pred_cam_pos, dtype=np.float64) @ CAM_TO_GT_AXES
+
+
+def gt_positions_frame0(gt_poses):
+    """GT camera centres expressed in the FRAME-0 GT CAMERA frame (metres).
+
+    Takes each stored pose to a 4x4 world transform and left-multiplies by
+    inv(pose[0]), i.e. the full rigid change of frame the reference scorer does:
+    the returned row i is R0^T (t_i - t_0), so the GT trajectory starts at the
+    origin AND is expressed on frame 0's own axes.
+
+    The rotation is what a translation-only alignment misses: if the capture's
+    first pose is rotated relative to the world, dropping R0^T scores a PERFECT
+    reconstruction as several metres wrong. Every capture shipped with this
+    assignment happens to start at identity, which hides the difference — the
+    rotation is applied anyway so a capture that does not cannot score nonsense.
+
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
+    """
+    gt = np.asarray(gt_poses, dtype=np.float64)
+    t = gt[:, :3]
+    qw, qx, qy, qz = gt[0, 3], gt[0, 4], gt[0, 5], gt[0, 6]
+    R0 = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()   # scipy order: x,y,z,w
+    return (t - t[0]) @ R0                                  # rows: R0^T (t_i - t_0)
 
 
 def mean_l2(pred_cam_pos, gt_poses):
     """
     Mean L2 distance between predicted and GT camera centres (metres).
 
-    Reconciles the two coordinate frames exactly as the original reconstruct.py
-    __main__ did before scoring:
-      * pred is in frame-0 CAMERA space  → flip Y to reach the Habitat world frame.
-      * GT is Habitat world [x,y,z,...]  → flip Z to match pred's display frame.
-      * origins are aligned (ICP starts at the frame-0 camera, not world origin).
+    Reconciles the two coordinate frames before scoring:
+      * pred is in the frame-0 CAMERA frame on IMAGE axes → flip Y and Z to reach
+        the GT sensor's axes (pred_positions_frame0).
+      * GT is stored as world poses [x, y, z, qw, qx, qy, qz] → transform by
+        inv(pose_0), giving R0^T (t_i - t_0) (gt_positions_frame0).
+    Both trajectories then start at the origin on the same axes, so they are
+    compared directly — no further alignment, and in particular no fitting of a
+    scale, rotation or offset TO the GT.
     Returns +inf if either trajectory is missing/empty.
 
     SPEC:
@@ -580,29 +944,24 @@ def mean_l2(pred_cam_pos, gt_poses):
         GT camera centres over the first n = min(len(pred), len(gt)) frames.
         - Guard: return float("inf") if either input is None or empty.
         - Reconcile frames before comparing:
-            pred (frame-0 camera space): negate the Y column (camera -> Habitat world).
-            gt   (Habitat world x,y,z):  negate the Z column (match pred display frame).
-        - Align origins by adding offset = gt_c[0] - pred[0] to every pred point
-          (ICP starts at the frame-0 camera, not the world origin — no scale/rotation
-          fit, translation only).
-        - Return mean over i of ||pred_aligned[i] - gt_c[i]||_2.
+            pred (frame-0 camera, image axes): negate the Y and Z columns.
+            gt   (world poses):  R0 = rotation matrix of pose 0's quaternion
+                 (stored qw first, scipy wants x,y,z,w); GT centre i becomes
+                 R0^T (t_i - t_0).
+        - Return mean over i of ||pred[i] - gt_c[i]||_2.
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     if gt_poses is None or len(gt_poses) == 0 or pred_cam_pos is None \
             or len(pred_cam_pos) == 0:
         return float("inf")
 
-    pred = np.asarray(pred_cam_pos, dtype=np.float64).copy()
-    pred[:, 1] *= -1                                   # cam → habitat world (Y flip)
-
-    gt_c = np.asarray(gt_poses, dtype=np.float64)[:, :3].copy()
-    gt_c[:, 2] *= -1                                   # match pred display frame (Z flip)
+    pred = pred_positions_frame0(pred_cam_pos)
+    gt_c = gt_positions_frame0(gt_poses)
 
     n = min(len(pred), len(gt_c))
-    offset = gt_c[0] - pred[0]                          # align origins
-    pred_al = pred[:n] + offset
-    return float(np.mean(np.linalg.norm(pred_al - gt_c[:n], axis=1)))
+    return float(np.mean(np.linalg.norm(pred[:n] - gt_c[:n], axis=1)))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -617,7 +976,8 @@ def make_trajectory(positions, color):
         [i, i+1] for i in 0..N-2 (a polyline through the trajectory), with every
         line painted `color`. Return the LineSet.
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     positions = np.asarray(positions)
     lines = [[i, i + 1] for i in range(len(positions) - 1)]
@@ -637,7 +997,8 @@ def remove_ceiling(pcd, margin=0.3):
         y > y_min + margin, carrying their matching colors across. Return a new
         PointCloud of the kept points/colors (input left unmodified).
 
-    REFERENCE IMPL (peer session) — carved to a TODO stub in the student pass.
+    SHIPS WORKING — the code below is the reference implementation. Not a stub;
+    you do not write this one.
     """
     pts  = np.asarray(pcd.points)
     cols = np.asarray(pcd.colors)

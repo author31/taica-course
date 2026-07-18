@@ -1,10 +1,14 @@
 # --- project data / envs ---
 outputs
-# pixi environments (rebuilt from pixi.lock via `pixi install`)
+run/
 .pixi/
 data_collection/
 data/
 replica_v1/
+*.ttl
+*.json
+*.npy
+
 
 # --- python ---
 __pycache__/
@@ -30,7 +34,3 @@ env/
 .idea/
 *.swp
 .DS_Store
-
-# --- agent scratch ---
-.agents/
-.qwen/

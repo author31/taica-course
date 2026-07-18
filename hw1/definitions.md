@@ -1,86 +1,150 @@
-# Data-Quality Definitions — Two Floors
+# HW1 factor definitions — v4
 
-Empirically derived data-quality ranges for the geometry-only robust-ICP SLAM pipeline
-(`hw1/utils.reconstruct`). These are **pipeline-specific thresholds**: conventions valid for *this*
-pipeline + coupling only, not transferable scientific constants. Produced by `autoresearch.py`
-via OFAT sweeps.
+This document defines the selectable input factors implemented by `api.py`.
+Every depth factor produces both a scalar for qualification and a uint8 0/255
+drop mask for intervention. A mask value of 255 means “drop this pixel”; 0 means
+“keep it.” Scalars and masks come from one shared computation.
 
-- **Metric:** coverage-aware correctness F-score (`hw1/completeness.py`, F = 2AC/(A+C), τ = 0.10 m, higher is better)
-- **Pass rule:** `F >= keep * F(axis_neutral)`, `keep = 0.5` (relative to per-axis neutral reference)
-- **Range domain:** measured observable (not knob value), knob range kept alongside
+## Shared conventions
 
-## Summary
+- Depth PNGs are uint16 millimetres; metres = `raw / 1000`.
+- Active depth factors use the ICP consumer's validity rule: `raw != 0`. There
+  is no configurable range cap.
+- Frame factors inspect one raster. Pair factors inspect one ordered adjacent
+  depth pair. `PriorWarpDepthResidual` may additionally use capture intrinsics
+  and the declared constant-velocity prior, but never the current pair's fitted
+  transform.
+- Lower-is-better factors pass at `value <= threshold`; higher-is-better factors
+  pass at `value >= threshold`.
+- A non-measurable lower-is-better factor returns `inf`; a non-measurable
+  higher-is-better factor returns `0.0`. These grade Fail without a special case.
+- Every pair factor records the number of pixels that contributed to its value.
+- Qualification defaults are provisional and must be calibrated on clean and
+  controlled-corruption captures.
 
-| Definition | Observable | First floor | Second floor |
-|---|---|---|---|
-| GoodBrightnessRange | `avg_luma_rec601` | **[146, 231]** (brightness 0.5–1.0) | *degenerate* — [18, 253] (full sweep) |
-| ValidDepthRatio | `valid_depth_fraction` | **≥ 0.570** (max_range ≥ 2.0 m) | **≥ 0.493** (max_range ≥ 1.0 m) |
+## Active menu
 
-Clean baseline F: first floor **0.505**, second floor **0.240**.
-
-## API threshold table
-
-Single source of truth mirrored by `hw1/api.py THRESHOLDS`. Exact values:
-
-| Floor | GoodBrightnessRange (`avg_luma_rec601`) | ValidDepthRatio (`valid_depth_fraction`) |
-|---|---|---|
-| 1 | [146.35, 230.87] | ≥ 0.570 |
-| 2 | [18.04, 252.84] (DEGENERATE — non-gating) | ≥ 0.493 |
-
-Only brightness + valid-depth are API-serviceable (single-sample computable); the noise axis is
-excluded (needs a clean-depth reference).
-
-## First floor (`trajectories/firstfloor.npy`)
-
-Clean baseline F = 0.505.
-
-| Definition | Observable range | Knob range | Axis-neutral F | Threshold |
+| Scope | Factor | Observable | Direction | Drop unit |
 |---|---|---|---|---|
-| GoodBrightnessRange | `avg_luma_rec601` [146.35, 230.87] | `lighting.brightness` 0.5–1.0 | 0.589 | 0.295 |
-| ValidDepthRatio | `valid_depth_fraction` [0.570, 1.000] | `depth.max_range` 2.0–10.0 m | 0.505 | 0.253 |
+| RGB frame | `HighlightClipping` | `clipHiFraction` | lower | none |
+| RGB frame | `ShadowClipping` | `clipLoFraction` | lower | none |
+| depth frame | `HighFrequencyDepthResidual` | `highFrequencyDepthResidual` (m) | lower | residual centre pixel |
+| depth frame | `FlyingPixelRatio` | `flyingPixelRatio` | lower | mixed boundary pixel |
+| depth frame | `ValidTileCoverage` | `validTileCoverage` | higher | under-supported tile |
+| depth pair | `IdentityMedianDepthChange` | `identityMedianDepthChange` (m) | lower | change outlier |
+| depth pair | `JointValidDepthRatio` | `jointValidDepthRatio` | higher | non-jointly-valid coordinate |
+| depth pair | `PriorWarpDepthResidual` | `priorWarpDepthResidual` (m) | lower | prior-warp outlier |
 
-Both axes give clean, non-degenerate bands. Brightness fails on both dark and bright sides.
+## RGB factors
 
-## Second floor (`trajectories/secondfloor.npy`)
+Let `V = max(R,G,B)` on an 8-bit RGB frame.
 
-Clean baseline F = 0.240 (harsher scene — lower ceiling F across all axes).
+`HighlightClipping` is the fraction of pixels with `V >= tauHi` and is qualified
+by `maxClipHiFraction`. `ShadowClipping` is the fraction with `V <= tauLo` and is
+qualified by `maxClipLoFraction`. Their implementation, parameters, thresholds,
+and annotation placement are unchanged from v3.
 
-| Definition | Observable range | Knob range | Axis-neutral F | Threshold |
-|---|---|---|---|---|
-| GoodBrightnessRange | `avg_luma_rec601` [18.04, 252.84] ⚠ | `lighting.brightness` 0.1–3.0 | 0.090 | 0.045 |
-| ValidDepthRatio | `valid_depth_fraction` [0.493, 1.000] | `depth.max_range` 1.0–10.0 m | 0.240 | 0.120 |
+Geometry-only ICP does not read RGB. These factors therefore describe intrinsic
+RGB health and serve as negative controls for this consumer; an RGB-only
+corruption is expected to leave `MapMeanL2` unchanged.
 
-⚠ **GoodBrightnessRange is degenerate.** The brightness-axis neutral F is already very low
-(0.090), so the pass threshold (0.045) is passed by all 11 sweep points — "never fails on low
-side / high side", band = full sweep range. The definition is **not usable** on this floor: the
-scene is too far from the ICP working point for the brightness coupling to produce a measurable
-cliff above the noise floor. Depth-ratio axis remains well-formed.
+## Depth-frame factors
 
-## Why no depth-noise definition
+### `HighFrequencyDepthResidual`
 
-`realized_sigma_z_m` (paired noisy−clean std) was **dropped as a query observable**: measuring it
-needs a clean-depth reference of the *same* trajectory, which the sweep has but no arbitrary API
-query sample does. Un-computable at inference → un-checkable range → useless for the ontology API.
-A reference-free σ_z proxy (local plane-fit residual, temporal std) would need its own re-measured
-band, not this one. Only `avg_luma_rec601` and `valid_depth_fraction` are single-sample computable
-and thus API-serviceable.
+On every fully valid 3×3 window, apply the Immerkær kernel
 
-## Generalization notes
+```text
+ 1 -2  1
+-2  4 -2
+ 1 -2  1
+```
 
-- **Depth-ratio** (max_range far-loss) generalizes: both floors keep ~half the valid-depth fraction.
-- **Brightness** does **not** generalize — clean on floor 1, degenerate on floor 2. Cross-scene brightness
-  thresholds need either a per-scene neutral calibration or a stronger coupling gain tuned to the harsher scene.
+and let `R` be its response. The scalar is
 
-## Provenance
+```text
+median(abs(R)) / (6 * 0.6745)
+```
 
-- Script: `autoresearch.py`
-- Results: `research_out/results.csv` (floor 1), `research_out_secondfloor/results.csv` (floor 2)
-- Curves: `research_out/curve_*.png`, `research_out_secondfloor/curve_*.png`
-- Definitions: `research_out/definitions.yaml`, `research_out_secondfloor/definitions.yaml`
+in metres. The mask flags response centres exceeding
+`max(residualMaskK * median(abs(R)), 0.001 m)`. The one-millimetre minimum avoids
+calling a real step edge noise when a quantised plane has zero median response.
+No fully valid 3×3 window gives `inf` and an empty drop mask.
 
-## Reproduce
+### `FlyingPixelRatio`
 
-Run from repo root:
+For each consumer-valid pixel near a local depth discontinuity, remove the centre
+from its configured odd window, split neighbour depths at their largest gap, and
+fit one image-coordinate depth plane to each side. The centre is a flying pixel
+when the two predicted planes differ by more than twice
+`flyingPixelPlanarityTol`, the centre lies between their predictions, and it is
+farther than that tolerance from both.
 
-- Floor 1: `pixi run -e habitat python autoresearch.py --trajectory trajectories/firstfloor.npy`
-- Floor 2: `pixi run -e habitat python autoresearch.py --trajectory trajectories/secondfloor.npy --out-dir research_out_secondfloor`
+The scalar is flagged pixels divided by all raster pixels. The mask contains the
+flagged pixels. A valid planar/no-edge frame returns 0 and an empty mask; a frame
+with no valid depth returns `inf`.
+
+### `ValidTileCoverage`
+
+Partition the raster from the top-left into `tileSize` squares, retaining smaller
+boundary tiles. A tile is supported when its non-zero depth fraction is at least
+`tileValidFloor`. The scalar is supported tiles divided by all tiles. The mask
+flags every pixel in an unsupported tile, so filtering removes weak geometry as
+a region rather than leaving isolated points.
+
+## Adjacent-depth-pair factors
+
+### `IdentityMedianDepthChange`
+
+On coordinates valid in both rasters, compute `C = abs(D0 - D1)`. The scalar is
+`median(C)`. The mask flags joint-valid coordinates above
+
+```text
+median(C) + changeMaskK * 1.4826 * MAD(C)
+```
+
+with a one-millimetre minimum above the median when MAD is zero. Shape mismatch
+or no jointly valid coordinate gives `inf`, an empty mask, and count zero.
+
+### `JointValidDepthRatio`
+
+The scalar is the number of coordinates non-zero in both rasters divided by the
+number of raster coordinates. The mask flags the complement of joint validity.
+Shape mismatch or an empty raster gives 0 and count zero.
+
+### `PriorWarpDepthResidual`
+
+Using capture intrinsics, unproject frame 0, transform its points into frame 1
+with the declared constant-velocity prior, project to frame 1, and compare warped
+depth with the observed depth. Points behind the observed surface by more than
+`priorWarpDepthGate` are treated as occluded and excluded from the scalar. The
+scalar is the median absolute residual over visible correspondences; the mask
+flags projected residuals above the gate.
+
+This factor is measured inside the baseline reconstruction loop immediately
+before fitting the current pair. `experiment` records its settings and pair
+scope, while `write_pair_measurements` later writes its value, status,
+contributing count, and mask. No correspondence gives `inf`, an empty mask, and
+count zero.
+
+## Mask application
+
+`experiment` writes masks below `<experiment>/masks/<Factor>/`:
+
+```text
+<stem>.png       frame factor
+<i>_<j>.png      pair factor
+```
+
+`reconstruct.py --mask-dir .../<Factor>` indexes both forms. Pair masks are
+incident on both endpoint frames. All incident drop masks are ORed and converted
+to `keep_mask = (drop == 0)`. Point-cloud validity remains
+`(depth_m > 0) & keep_mask`; a mask can never resurrect an invalid depth.
+
+## Validation obligation
+
+A factor is not consumer-binding merely because its mask changes a point cloud.
+Promotion requires a matched clean/corrupted full-batch contrast, per-link
+mechanism evidence, and held-out corruption validation. Report both the scalar
+response and the baseline-versus-masked `MapMeanL2` differential. Preserve null
+or adverse filtering results.

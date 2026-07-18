@@ -1,0 +1,997 @@
+# HW1 RGB-D capture quality ontology -- TBox v3
+#
+# This file is the ONLY ontology file in the project. It is hand-edited; every
+# other .ttl in the tree is machine generated or student-authored (optional
+# batch.ttl sidecar by the deprecated `api.py batch2ttl`; hw1/experiments/<expname>.ttl
+# written by the STUDENT above the machine marker and by `api.py experiment` /
+# `reconstruct.py` below it).
+#
+# This file is the TBox: every IRI, class name, predicate name and parameter
+# name used by the tooling is declared here. Section numbers in the comments
+# below are the assignment's v3 design clauses.
+#
+# THREE THINGS THAT CHANGED IN v2 AND STILL HOLD -- read these first:
+#
+#  1. SINGLE GRAPH. v1 put each experiment in its own named graph. RDF dataset
+#     semantics is deliberately unstandardised by W3C, Turtle cannot carry a
+#     graph name, and one missed `to_graph` gave a silent zero-row query. v2 has
+#     no named graphs at all: disambiguation is carried by IRIs. Batch, Frame and
+#     image IRIs are SHARED structure; everything an experiment mints
+#     (annotations, pairs, runs, settings) is EXPERIMENT-SCOPED. Two experiments
+#     over one batch therefore produce two disjoint annotation sets over the same
+#     frame IRIs and nothing collides. That scoping rule is what replaces named
+#     graphs and it is the one rule that must never be relaxed.
+#
+#  2. STATUSES BAKED AT MEASURE TIME. v1 graded values at read time by joining
+#     against Band individuals -- a 4-way join before a student saw one verdict.
+#     v2 writes, next to every observable value, a `<value>Status` of hw1:Pass or
+#     hw1:Fail, computed when the value is measured against the QualificationSetting
+#     recorded on the SAME experiment. The raw value is always stored too, so
+#     re-grading stays possible: a status is a denormalised cache whose truth is
+#     (value + settings). Binary only -- no Marginal, no gradeRank. Strictness is
+#     tunable because a threshold is a per-experiment setting, not a global
+#     individual. See §4.5 for the exact Pass rule.
+#
+#  3. PARAMETERS AND THRESHOLDS ARE ONE VOCABULARY. v1 had Knobs (measurement
+#     numbers, in the experiment graph) and Band bounds (thresholds, in the default
+#     graph) as two unrelated things. v2 has one hw1:Parameter class and one
+#     hw1:FactorSetting node shape; a parameter's hw1:paramRole says which of the
+#     three verdicts it carries. That role IS the fix instruction printed by the
+#     verdict section of `api.py explore`.
+#
+# FOUR THINGS CHANGED IN v3 -- they are why this file grew five predicates and
+# lost three:
+#
+#  A. AN EXPERIMENT IS A STUDENT-AUTHORED DECLARATION, not a machine-generated
+#     total measurement pass. The student writes Turtle: which batch
+#     (hw1:batchFile + hw1:onBatch), which factors to evaluate
+#     (hw1:evaluatesFactor, 1..8 from the menu), and any threshold or measurement
+#     overrides (hw1:hasFactorSetting). `api.py experiment` then measures exactly
+#     what was declared and appends values and verdicts BELOW a marker line in the
+#     same file. Everything the old `experiment --batch-dir --floor --set ...`
+#     flags carried now lives in the declaration. See §3.1 / §4.2.
+#
+#  B. SELECTION SCOPES EVERYTHING. Nothing is measured that was not selected, so
+#     "total" now means total OVER THE SELECTION: the recorded setting vector
+#     covers the selected factors plus the always-on run factors, and an
+#     annotation carries exactly the selected factors' observables. Within that
+#     scope a missing property is a bug, not a state. The run factors
+#     hw1:ReconstructionAccuracy and hw1:Coverage are never selectable and always
+#     evaluated.
+#
+#  C. ANNOTATIONS ARE PER MODALITY, AND THERE IS ONE AGGREGATE PREDICATE. v2 had
+#     one FrameAnnotation per frame carrying both modalities, plus hw1:frameStatus
+#     and hw1:pairStatus. v3 mints one annotation per frame per modality that has
+#     at least one selected factor (IRI tail .../annotation/<n>/<kind>, kind is
+#     rgb or depth; a modality with no selected factor gets NO node), linked to
+#     the raster it measures by hw1:describesImage, and aggregates every carrying
+#     node with the single predicate hw1:qualificationStatus.
+#
+#  D. WRITE-ONCE, SEALED. An experiment file is assessed exactly once; re-running
+#     `experiment` on a file that already has the marker is a hard error, and any
+#     tuning is a brand-new file under a brand-new name. hw1:declarationDigest is
+#     the tamper seal that makes that enforceable. hw1/experiments/ is therefore
+#     an append-only lab notebook. The experiment DIGEST IDENTITY of v2 is gone
+#     with it: an experiment is identified by its NAME (file stem = IRI tail).
+#
+# Also gone in v3: the SPARQL layer. There is no `query` command, no queries/*.rq,
+# no pyoxigraph. Attribution, per-frame tables and cross-experiment comparison are
+# computed in code by `api.py explore`. The hw1:overProperty / hw1:statusProperty /
+# hw1:polarity / hw1:qualifiedBy wiring below STAYS exactly as it was -- `explore`
+# resolves factors generically through it, in Python, exactly as the queries did
+# in SPARQL, so adding a menu factor still needs no per-factor branch anywhere.
+#
+# Deleted v1 and v2 vocabulary is listed with its replacement at the end of this
+# file.
+
+@prefix hw1:     <http://taica.course/hw1/ontology#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix schema:  <https://schema.org/> .
+@prefix qudt:    <http://qudt.org/schema/qudt/> .
+@prefix unit:    <http://qudt.org/vocab/unit/> .
+@prefix skos:    <http://www.w3.org/2004/02/skos/core#> .
+@prefix prov:    <http://www.w3.org/ns/prov#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix vann:    <http://purl.org/vocab/vann/> .
+
+# `dqv:` is gone. The Result / Metric shape it carried was the
+# named-graph-era result model; a hw1:QualityFactor is now defined by its own
+# four properties and needs no upstream superclass. `prov:` survives for exactly
+# one term, prov:wasDerivedFrom, asserted BETWEEN BATCHES by `batch2ttl
+# --derived-from` -- there are no derived experiments any more.
+
+<http://taica.course/hw1/ontology> a owl:Ontology ;
+    dcterms:title "HW1 RGB-D capture quality ontology"@en ;
+    owl:versionIRI <http://taica.course/hw1/ontology/4.0.0> ;
+    vann:preferredNamespacePrefix "hw1" ;
+    vann:preferredNamespaceUri "http://taica.course/hw1/ontology#" .
+
+
+# =============================================================================
+# 1. The model at a glance
+# =============================================================================
+#
+#   Batch                                  structure; changes only when pixels change
+#   |-- hw1:hasGenerationSetting --> FactorSetting        role Generation
+#   `-- hw1:hasFrame --> Frame
+#       |-- hw1:frameIndex
+#       |-- hw1:hasRGBImage   --> RGBImage    (schema:contentUrl, nothing else)
+#       `-- hw1:hasDepthImage --> DepthImage  (schema:contentUrl, nothing else)
+#
+#   Experiment                             one declared assessment; written once
+#   |                                      DECLARED BY THE STUDENT:
+#   |-- hw1:batchFile          --> "path/to/capture-dir" how the CLI reaches pixels
+#   |-- hw1:onBatch            --> Batch                 must match that directory's batch
+#   |-- hw1:evaluatesFactor    --> QualityFactor         1..8 menu factors; the scope
+#   |-- hw1:hasFactorSetting   --> FactorSetting      roles Measurement | Qualification
+#   |                                      WRITTEN BY THE MACHINE, BELOW THE MARKER:
+#   |-- hw1:declarationDigest  --> "<64 hex>"            seal over the student section
+#   |-- hw1:hasFactorSetting   --> FactorSetting      the defaulted remainder
+#   |-- hw1:producesAnnotation --> FrameAnnotation    per frame PER MODALITY
+#   |-- hw1:producesPair       --> FramePair          per consecutive pair, always
+#   `-- hw1:hasRun             --> ReconstructionRun  written by reconstruct.py
+#
+# The image node is NOT the observation. The FrameAnnotation is, and its IRI
+# carries the experiment name and the modality. That is what satisfies RDF Data
+# Cube IC-12 (no two observations in a dataset share a full dimension tuple)
+# without named graphs: measure the same batch twice at different tauHi and you
+# get two annotation nodes, not two contradictory triples on one image node.
+# hw1:describesImage points from the observation back at the raster it measured,
+# which is the join the per-modality split made necessary.
+
+
+# =============================================================================
+# 2. Structure -- derived from the capture directory (rgb/ + depth/)
+# =============================================================================
+# Structure only: no observables, no pairs. `declare` / `experiment` / `explore`
+# read the capture directory directly. An optional `batch.ttl` sidecar (the
+# deprecated `batch2ttl` command) may still record GenerationSettings.
+
+hw1:Batch      a rdfs:Class ;
+    rdfs:comment "One capture directory: the RGB-D frames produced by one drive of the agent, possibly with corruption already baked into the pixels."@en .
+hw1:Frame      a rdfs:Class ;
+    rdfs:comment "One time step: an RGB image and a depth image sharing a file stem."@en .
+hw1:RGBImage   a rdfs:Class ; rdfs:subClassOf schema:ImageObject .
+hw1:DepthImage a rdfs:Class ; rdfs:subClassOf schema:ImageObject .
+
+hw1:hasFrame      a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range hw1:Frame .
+hw1:hasRGBImage   a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range hw1:RGBImage .
+hw1:hasDepthImage a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range hw1:DepthImage .
+
+hw1:batchName a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string ;
+    rdfs:comment "floor-qualified directory name, e.g. \"floor1_baseline\". Different pixels get a different name, which is what keeps generation settings out of every experiment-side identity question: an experiment naming this batch is talking about these pixels and no others."@en .
+hw1:batchPath a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string .
+hw1:floor     a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:integer .
+
+# Deliberately NO rdfs:domain. hw1:frameIndex is carried by a Frame (its file
+# stem) and, redundantly, by the FrameAnnotation that annotates it (so a reader
+# can order annotations without a join back to the frame). Declaring one domain
+# would assert under RDFS entailment that every annotation is a Frame, which is
+# false; declaring a union domain needs OWL, and no reasoner runs here. This is
+# the pattern every multi-domain predicate in this file follows -- see also
+# hw1:qualificationStatus in section 5.
+hw1:frameIndex a rdf:Property ; rdfs:range xsd:integer ;
+    rdfs:comment "Integer file stem, decimal and unpadded. Carried by hw1:Frame and by hw1:FrameAnnotation. ORDER BY this, never by IRI string -- unpadded stems break lexicographic order. NOT unique among annotations since v3: the rgb and the depth annotation of one frame share its index, and are told apart by hw1:describesImage and by the <kind> tail of their IRIs."@en .
+
+
+# =============================================================================
+# 3. Closed term vocabularies
+# =============================================================================
+# Four small enumerations. Each is a class with a fixed set of named individuals,
+# so code can read the term instead of parsing prose out of a comment. All
+# four are skos:Concept subclasses to say "this is a closed vocabulary of terms",
+# not a class of measurable things.
+
+hw1:Polarity a rdfs:Class ; rdfs:subClassOf skos:Concept ;
+    rdfs:comment "Which direction of a factor's value is better. Read by the status rule of §4.5."@en .
+hw1:HigherIsBetter a hw1:Polarity ; rdfs:label "higher is better"@en ;
+    rdfs:comment "Pass iff value >= threshold."@en .
+hw1:LowerIsBetter  a hw1:Polarity ; rdfs:label "lower is better"@en ;
+    rdfs:comment "Pass iff value <= threshold."@en .
+
+hw1:Status a rdfs:Class ; rdfs:subClassOf skos:Concept ;
+    rdfs:comment "Exactly two individuals. v1's three-grade Good/Marginal/Bad scale is deleted: a Marginal verdict tells a student nothing actionable, and strictness is now tunable through the per-experiment threshold instead of through the grade scale."@en .
+hw1:Pass a hw1:Status ; skos:prefLabel "pass"@en .
+hw1:Fail a hw1:Status ; skos:prefLabel "fail"@en ;
+    rdfs:comment "Also the verdict for any non-finite value on the failing side: NaN is always Fail, and the fail-closed measurer sentinels (INF for lower-is-better, 0.0 for higher-is-better) grade Fail by the ordinary rule, with no special case."@en .
+
+hw1:SelectionMode a rdfs:Class ; rdfs:subClassOf skos:Concept ;
+    rdfs:comment "Which frames a ReconstructionRun consumed. Two runs of one experiment differ only in this and in their IRI, so baseline and selected cannot overwrite each other -- that is what replaces v1's derived experiments."@en .
+hw1:FullBatch    a hw1:SelectionMode ; skos:prefLabel "full batch"@en ;
+    rdfs:comment "Every frame of the batch, in order. Run IRI mode `baseline`."@en .
+hw1:GoodSegments a hw1:SelectionMode ; skos:prefLabel "good segments"@en ;
+    rdfs:comment "Only frames inside contiguous usable-link segments -- every maximal chain of usable links, whatever its length. Run IRI mode `selected`; these runs also assert hw1:usedFrame. There is no length floor: a minimum-segment-length parameter was removed because it is a property of the ICP backend's own behaviour, not of the data's quality, and the quality layer does not get to encode it."@en .
+hw1:MaskFiltered a hw1:SelectionMode ; skos:prefLabel "mask filtered"@en ;
+    rdfs:comment "A reconstruction after dropping pixels flagged by one exported factor-mask directory. Run IRI mode `masked`; hw1:maskFactor records which factor supplied the mask."@en .
+
+hw1:SettingRole a rdfs:Class ; rdfs:subClassOf skos:Concept ;
+    rdfs:comment "What kind of thing a setting configures -- and therefore what a student must FIX when that setting is named as the culprit. The role printed beside a culprit setting in the verdict section of `api.py explore` IS the verdict. Three-way, replacing v1's two-way CorruptionKnob/MeasurementKnob split."@en .
+hw1:GenerationSetting a hw1:SettingRole ; skos:prefLabel "generation setting"@en ;
+    rdfs:comment "Describes how the pixels were produced. Attached to a Batch via hw1:hasGenerationSetting. Verdict when culprit: the data is bad -- regenerate it / re-drive the agent."@en .
+hw1:MeasurementSetting a hw1:SettingRole ; skos:prefLabel "measurement setting"@en ;
+    rdfs:comment "Changes only how pixels are scored, never the pixels. Attached to an Experiment via hw1:hasFactorSetting. Verdict when culprit: the measurement is wrong -- change the number and re-measure."@en .
+hw1:QualificationSetting a hw1:SettingRole ; skos:prefLabel "qualification setting"@en ;
+    rdfs:comment "A threshold: turns a measured value into Pass or Fail. Attached to an Experiment via hw1:hasFactorSetting. Verdict when culprit: the judgement is wrong -- change the threshold and re-qualify. These are the individuals that replaced v1's Band intervals."@en .
+
+
+# =============================================================================
+# 4. Experiment layer -- declared by the student, completed by `experiment` and
+#    `reconstruct.py`
+# =============================================================================
+# THE v3 DECLARATION WORKFLOW, in the order the file is written (§3.1):
+#
+#   1. The student writes hw1/experiments/<expname>.ttl by hand. Above the marker
+#      line there may be NOTHING but the Experiment node's own triples
+#      (rdf:type, rdfs:label, hw1:batchFile (capture dir), hw1:onBatch, hw1:evaluatesFactor,
+#      hw1:hasFactorSetting) and the hw1:FactorSetting nodes they point at. An
+#      annotation, a status, an observable value or a run above the marker is a
+#      hard error: VERDICTS ARE COMPUTED, NEVER DECLARED. The Experiment IRI's
+#      tail must equal the file stem -- the name IS the identity (§6).
+#
+#   2. `api.py experiment DECLARATION.ttl` validates that declaration, follows
+#      hw1:batchFile to the capture directory, measures exactly the selected factors, and
+#      APPENDS -- once, ever -- the marker line
+#
+#        # ============ MACHINE SECTION (regenerated by api.py -- do not edit) ============
+#
+#      followed by the machine section: the hw1:declarationDigest seal, the
+#      machine-minted FactorSettings that default every required parameter the
+#      student left out, one FrameAnnotation per frame per selected modality, and
+#      one FramePair per consecutive pair. Subjects are re-opened across the
+#      marker -- duplicate @prefix directives mid-file are legal Turtle -- so the
+#      whole file parses as one graph and each section also parses alone.
+#
+#   3. WRITE-ONCE. Running `experiment` again on a file that already contains the
+#      marker is a hard error. There is no --force and no re-assess path: any
+#      tuning, of a threshold or a factor or the batch, is a brand-new experiment
+#      under a brand-new name. The only later mutation is `reconstruct.py`'s
+#      write_run, because runs are the experiment's OUTCOME, not its design.
+#
+#   4. SEALED. hw1:declarationDigest is a sha256 over the student section's exact
+#      bytes. read_experiment and write_run recompute and verify it before doing
+#      anything; a mismatch means the declaration was edited after assessment,
+#      which makes it a different experiment that needs a different file. Without
+#      the seal, write-once is unenforceable -- nothing else can see an edit above
+#      the marker.
+#
+# The consequence, and the pedagogical point: hw1/experiments/ is an append-only
+# LAB NOTEBOOK. Declaration and verdicts in one file are always mutually
+# consistent, and the report is the series of declarations and what they returned.
+#
+# Which vector is "total" changed with it. v2 recorded every declared Measurement
+# and Qualification parameter on every experiment. v3 records the vector that the
+# SELECTION requires (§4.2): every selected factor's hw1:qualifiedBy
+# parameter, every Measurement parameter whose primary or affected factor is
+# selected, and the three run-factor parameters always. An experiment evaluating
+# only depth factors records no tauHi, because recording a level that touched
+# nothing would be as false an assertion as a defaulted Generation setting.
+
+hw1:Experiment a rdfs:Class ;
+    rdfs:comment "One declared assessment of one batch: a factor selection plus the setting vector that selection requires. DoE calls the vector a treatment combination. Exactly one hw1:Experiment subject per experiment file -- zero or several is an error in api.read_declaration / api.read_experiment, not a guess. Identified by NAME: the IRI tail equals the declaration file's stem. Assessed exactly once (write-once, above); every tuning is a new file."@en .
+
+hw1:FrameAnnotation a rdfs:Class ;
+    rdfs:comment "One frame's ONE MODALITY as measured by ONE experiment: that modality's selected observables, their statuses, and the hw1:qualificationStatus aggregate over them. Since v3 there are up to two per frame -- .../annotation/<n>/rgb and .../annotation/<n>/depth -- and a modality with no selected factor gets NO node at all, so an annotation's mere existence already says its modality was in scope. This node, not the image node, is the Data Cube observation, which is why measuring one batch twice never produces contradictory triples."@en .
+
+hw1:FramePair a rdfs:Class ;
+    rdfs:comment "An ordered pair of temporally adjacent frames as measured by ONE experiment; carries the pairwise observables that predict frame-to-frame ICP success. W3C n-ary relation Pattern 1. Minted per experiment, not per batch: a pair is two links and an index, so caching skeletons in batch.ttl bought nothing and forced every experiment to share them. ALWAYS minted, for every consecutive pair, even when no pair factor is selected -- the pair nodes are what carry adjacency into the experiment file and reconstruct.py reads nothing else. Only the OBSERVABLES follow the selection."@en .
+
+hw1:ReconstructionRun a rdfs:Class ;
+    rdfs:comment "One execution of reconstruct.py over one experiment, under one hw1:SelectionMode. Carries the reconstruction outcome values and their statuses. Its two factors, hw1:ReconstructionAccuracy and hw1:Coverage, are never selectable and always evaluated."@en .
+
+hw1:onBatch a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:Batch ;
+    rdfs:comment "Which batch was assessed, as an IRI. Declared by the student and cross-checked at `experiment` time against the capture directory named by hw1:batchFile: the IRI must equal batch_iri(batch_name(dir, floor)), with floor parsed from the IRI. A mismatch is a hard error, because it is the \"measured capture A, wrote into capture B\" bug caught at declaration time instead of after the numbers exist. A legacy path to a batch.ttl is still accepted and checked against that file's Batch IRI."@en .
+
+hw1:batchFile a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range xsd:string ;
+    rdfs:comment "Path to the capture directory (rgb/ + depth/), resolved against the current working directory when relative. This is how a declaration reaches pixels -- declaration -> batchFile -> rgb/ + depth/. The directory's floor-qualified name must equal the declared hw1:onBatch. A path and not an IRI on purpose: an IRI says which batch, a path says where to read it. A legacy path to a batch.ttl is still accepted (deprecated): the capture is then that file's hw1:batchPath."@en .
+
+hw1:evaluatesFactor a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:QualityFactor ;
+    rdfs:comment "The experiment's scope, declared by the student. Select 1..8 input factors: two RGB clipping factors, three depth-frame factors, and three adjacent-depth-pair factors. Run factors are unselectable. Required settings, annotations, observables and masks follow from this property."@en .
+
+hw1:declarationDigest a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range xsd:string ;
+    rdfs:comment "NEW IN v3: the write-once tamper seal (§3.1). The sha256 hex digest of the file's bytes from offset 0 up to the start of the MACHINE SECTION marker line -- i.e. over the student-authored declaration exactly as written, whitespace and comments included. Stamped by `experiment` below the marker; recomputed and verified by read_experiment and write_run before either does anything else, with a mismatch a hard error. NOT an identity: an experiment is identified by its name (§6), and v2's hw1:experimentId digest identity is deleted. This digest answers only one question -- has the declaration changed since it was assessed -- and if it has, the answer is a new file, not a re-assessment."@en .
+
+hw1:producesAnnotation a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:FrameAnnotation ;
+    rdfs:comment "Asserted forward only, once per minted annotation -- so up to twice per frame since v3, once per selected modality. No OWL reasoning runs here, so readers that need the inverse walk it in code."@en .
+hw1:producesPair a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:FramePair ;
+    rdfs:comment "Asserted forward only, once per consecutive pair of the batch, unconditionally."@en .
+hw1:hasRun       a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:ReconstructionRun ;
+    rdfs:comment "At most two per experiment, one per hw1:SelectionMode. Written by api.write_run, which is the ONLY writer of run triples and the ONLY mutation an already-assessed experiment file accepts."@en .
+
+hw1:annotatesFrame a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Frame ;
+    rdfs:comment "Back-link from the experiment-scoped observation to the shared structural frame. This is the join that lets one read span two files. Kept in v3 for exactly that frame-level join -- both of a frame's annotations point at the same Frame, which is what makes the per-frame verdict a conjunction over them."@en .
+
+hw1:describesImage a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range schema:ImageObject ;
+    rdfs:comment "NEW IN v3: the annotation's link to the raster it measured -- the frame's hw1:RGBImage or its hw1:DepthImage. hw1:annotatesFrame says WHICH TIME STEP, this says WHICH MODALITY, and the split is what lets one frame carry two annotations without them being confusable. Range is schema:ImageObject, the shared superclass of hw1:RGBImage and hw1:DepthImage: naming either subclass would be a false assertion about half the annotations, and a union range needs OWL. The image node still carries schema:contentUrl and nothing else -- the arrow points from the observation at the raster, never the other way."@en .
+
+hw1:sourceFrame a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range hw1:Frame ;
+    rdfs:comment "Earlier frame; ICP source."@en .
+hw1:targetFrame a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range hw1:Frame ;
+    rdfs:comment "Later frame; ICP target."@en .
+hw1:pairIndex a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:integer ;
+    rdfs:comment "0-based ordinal of the pair in ascending (i,j) order -- an ordinal, NOT a frame stem. ORDER BY this, never by IRI string."@en .
+
+hw1:selectionMode a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range hw1:SelectionMode .
+hw1:usedFrame a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range hw1:Frame ;
+    rdfs:comment "Asserted by hw1:GoodSegments runs only. Reconstruction provenance lives in the graph, so no CSV sidecar is needed to answer \"which frames went into this number\"."@en .
+hw1:runFrameCount a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:integer ;
+    rdfs:comment "How many frames the run consumed. Redundant with COUNT(?usedFrame) for a selected run, but a full-batch run asserts no usedFrame at all, so the count has to be stated."@en .
+hw1:maskFile a rdf:Property ; rdfs:range xsd:string ;
+    rdfs:comment "Relative path from the assessed experiment file to a uint8 PNG where 255 flags a pixel to drop and 0 keeps it. Carried by a FrameAnnotation or FramePair; the factor directory in the path identifies the selected factor."@en .
+hw1:maskFactor a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range hw1:QualityFactor ;
+    rdfs:comment "The selected input factor whose exported drop-mask directory was applied by a hw1:MaskFiltered run."@en .
+hw1:diagnosticFile a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:string ;
+    rdfs:comment "Relative path to the versioned per-link diagnostic JSON sidecar produced by the same reconstruction call."@en .
+
+
+# =============================================================================
+# 5. Observables -- value properties and their baked statuses
+# =============================================================================
+# Every observable is a PAIR of predicates: `x` carries the raw double, `xStatus`
+# carries hw1:Pass or hw1:Fail computed at measure time. The naming rule is
+# frozen and mechanical -- status predicate = value predicate + "Status" -- but
+# code must NEVER build the status IRI by string concatenation: read it from the
+# factor's hw1:statusProperty (section 6), which is what makes `explore`'s
+# attribution pass generic over factors it has never heard of.
+#
+# Which of these predicates appear on a given node follows the experiment's
+# hw1:evaluatesFactor selection (§4.3). Totality is PER SELECTION:
+# inside the declared scope a missing value or status is a bug, outside it the
+# absence is the selection saying so.
+#
+# Every value predicate is xsd:double, including counts-as-fractions, because
+# xsd:decimal cannot carry INF and the measurers are fail-closed: they return
+# INF or 0.0 on the failing side rather than raising. INF serializes as
+# "INF"^^xsd:double, NaN as "NaN"^^xsd:double.
+
+# ---- frame observables (domain hw1:FrameAnnotation) ----
+# In v1 these hung off hw1:DepthImage / hw1:RGBImage. That was the named-graph
+# design: the image node was the observation and the graph scoped it. With one
+# graph, two experiments would write two contradictory hw1:clipHiFraction triples
+# onto the same image node. Moving the domain to the experiment-scoped
+# annotation is the whole fix. An image node now carries schema:contentUrl and
+# nothing else.
+#
+# Since v3 the annotation is per modality, so these split by the raster they
+# are measured from (§4.3): hw1:clipHiFraction, hw1:clipLoFraction and
+# hw1:meanValue land on the RGB annotation; the depth-frame observables land on
+# the DEPTH one. The domain stays hw1:FrameAnnotation for all of them -- the
+# modality is stated by hw1:describesImage, not by a second pair of annotation
+# subclasses nobody would ever join on.
+
+hw1:highFrequencyDepthResidual a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "high-frequency depth residual"@en ; qudt:unit unit:M ;
+    rdfs:comment "Median absolute Immerkær response divided by 6*0.6745 over fully consumer-valid 3x3 windows."@en .
+hw1:highFrequencyDepthResidualStatus a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Status .
+
+hw1:flyingPixelRatio a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "flying pixel ratio"@en ;
+    rdfs:comment "Fraction of raster pixels that lie at a discontinuity but agree with neither fitted local foreground nor background plane."@en .
+hw1:flyingPixelRatioStatus a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Status .
+
+hw1:validTileCoverage a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "valid tile coverage"@en ;
+    rdfs:comment "Fraction of configured image tiles whose non-zero depth-return fraction meets tileValidFloor."@en .
+hw1:validTileCoverageStatus a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Status .
+
+hw1:clipHiFraction a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "highlight clip fraction"@en ;
+    rdfs:comment "Fraction in [0,1] of pixels with max(R,G,B) >= tauHi (at least one channel saturated). Counted against the tauHi recorded on the experiment that measured it, never against a batch-level threshold."@en .
+hw1:clipHiFractionStatus a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Status .
+
+hw1:clipLoFraction a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "shadow clip fraction"@en ;
+    rdfs:comment "Fraction in [0,1] of pixels with max(R,G,B) <= tauLo (every channel crushed)."@en .
+hw1:clipLoFractionStatus a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range hw1:Status .
+
+# The one observable with NO status property, on purpose: there is no
+# hw1:QualityFactor over it, so there is no polarity and no threshold, so there
+# is nothing to compute a Pass from. It exists as a deliberately weak baseline --
+# students compare "is the picture dark on average" against the factors that
+# actually predict reconstruction failure and find that it does not. Giving it a
+# status would quietly promote it to a criterion.
+hw1:meanValue a rdf:Property ; rdfs:domain hw1:FrameAnnotation ; rdfs:range xsd:double ;
+    rdfs:label "mean value"@en ;
+    rdfs:comment "mean(max(R,G,B)) over the frame, in [0,255]. Band-less baseline; takes no part in any hw1:qualificationStatus. Written whenever an RGB annotation exists -- it is not selectable, because it is not a factor; it is the control the selectable factors are supposed to beat."@en .
+
+# ---- pair observables (domain hw1:FramePair) ----
+
+hw1:identityMedianDepthChange a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:double ;
+    rdfs:label "identity median depth change"@en ; qudt:unit unit:M ;
+    rdfs:comment "Median absolute same-coordinate depth change over jointly non-zero pixels."@en .
+hw1:identityMedianDepthChangeStatus a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range hw1:Status .
+hw1:identityMedianDepthChangePixelCount a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:integer .
+
+hw1:jointValidDepthRatio a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:double ;
+    rdfs:label "joint valid depth ratio"@en ;
+    rdfs:comment "Fraction of image coordinates carrying non-zero depth in both adjacent frames."@en .
+hw1:jointValidDepthRatioStatus a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range hw1:Status .
+hw1:jointValidDepthPixelCount a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:integer .
+
+hw1:priorWarpDepthResidual a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:double ;
+    rdfs:label "prior-warp depth residual"@en ; qudt:unit unit:M ;
+    rdfs:comment "Median projective depth residual after the declared constant-velocity prior and before the current pair's ICP fit."@en .
+hw1:priorWarpDepthResidualStatus a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range hw1:Status .
+hw1:priorWarpDepthResidualPixelCount a rdf:Property ; rdfs:domain hw1:FramePair ; rdfs:range xsd:integer .
+
+# ---- run observables (domain hw1:ReconstructionRun) ----
+# New in v2. In v1 these were hw1:ResultMeasure individuals graded by Bands
+# through a parallel hw1:Result shape. They are ordinary observables now, over
+# ordinary QualityFactors, so attribution reaches a failing run and a failing
+# frame factor through exactly one pattern. Unlike every observable above them,
+# these two are written on EVERY experiment: their factors are not selectable.
+
+hw1:mapMeanL2 a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:double ;
+    rdfs:label "trajectory mean L2 error (legacy predicate name)"@en ;
+    qudt:unit unit:M ;
+    rdfs:comment "Mean L2 distance in metres between predicted and ground-truth CAMERA CENTRES after the fixed frame reconciliation in utils.mean_l2. Despite the legacy predicate name, this is a trajectory metric, not a point-cloud map metric; coverageF supplies the complementary map-geometry outcome."@en .
+hw1:mapMeanL2Status a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range hw1:Status .
+
+hw1:coverageF a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:double ;
+    rdfs:label "coverage-aware F-score"@en ;
+    rdfs:comment "Coverage-aware F-score of the reconstructed map against a fixed whole-scene ground-truth map, in [0,1]. reconstruct.py writes it when given --reference-root; completeness.py can also add it later. api.write_run only ever touches the keys it was given."@en .
+hw1:coverageFStatus a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range hw1:Status .
+
+# Statusless mechanism evidence for the selected-run falsification probe
+# (§14).  These are observations about how the consumer handled the
+# selection, not quality factors and not additional thresholds.
+hw1:gatedSteps a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:integer ;
+    rdfs:label "gated ICP steps"@en ;
+    rdfs:comment "Number of proposed relative transforms rejected by the ICP plausibility gate during this run."@en .
+hw1:spliceCount a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:integer ;
+    rdfs:label "selection splices"@en ;
+    rdfs:comment "GoodSegments only: number of boundaries between maximal usable-link segments concatenated for the diagnostic selected run."@en .
+hw1:maxGapLength a rdf:Property ; rdfs:domain hw1:ReconstructionRun ; rdfs:range xsd:integer ;
+    rdfs:label "maximum splice gap"@en ;
+    rdfs:comment "GoodSegments only: largest number of omitted frame indices at a segment boundary."@en .
+
+# ---- the aggregate (frozen, §4.5) ----
+# Stored, not derived at read time, for the same reason as the per-factor
+# statuses: one predicate instead of an n-way conjunction everywhere something
+# asks "was this node usable".
+#
+# ONE predicate in v3, where v2 had two. hw1:frameStatus and hw1:pairStatus are
+# deleted: they said the same thing about different node classes, and the
+# per-modality split would have needed a third name for the same idea. The
+# CARRYING NODE says what was aggregated, so the predicate does not have to.
+
+hw1:qualificationStatus a rdf:Property ; rdfs:range hw1:Status ;
+    rdfs:comment "The conjunction of the selected factor statuses on the node that carries it. On a hw1:FrameAnnotation: hw1:Pass iff every SELECTED factor of that annotation's modality is Pass -- so the rgb annotation aggregates only the selected RGB factors and the depth annotation only the selected depth ones. hw1:meanValue has no factor and never participates. On a hw1:FramePair: hw1:Pass iff every SELECTED pair factor is Pass, and vacuously hw1:Pass when no pair factor is selected, because pairs are minted unconditionally. TOTAL on every annotation and every pair that exists -- a node without it is a bug, never a third state. Replaces v2's hw1:frameStatus and hw1:pairStatus."@en .
+
+# Deliberately NO rdfs:domain, for the reason given at hw1:frameIndex in section
+# 2: the property is carried by hw1:FrameAnnotation AND by hw1:FramePair, so any
+# single domain would assert under RDFS entailment that pairs are annotations,
+# and a union domain needs OWL with no reasoner to consume it.
+
+# TWO VERDICTS ABOVE THIS ONE ARE NOT STORED AT ALL, and that is deliberate --
+# both span several nodes, so storing either would create a further thing that
+# goes stale when any of the nodes underneath it is re-measured. Both are
+# computed in api.read_experiment (§4.5):
+#
+#   FRAME USABLE = every annotation of that frame is Pass. Vacuously usable when
+#   the frame has no annotations at all, which is the pair-only selection.
+#   v2 stored this as hw1:frameStatus; v3 does not, because with per-modality
+#   annotations there is no single node left to hang it on.
+#
+#   USABLE LINK = the pair is Pass AND both endpoint frames are usable. This is
+#   the segment-cut criterion reconstruct.py selects on, and it was already
+#   computed rather than stored in v2 for the same reason.
+
+
+# =============================================================================
+# 6. Quality factors
+# =============================================================================
+# A QualityFactor is the reified answer to "what does this number mean, and what
+# counts as good". It names the value property it grades, the status property
+# that caches the verdict, the direction that is better, and the parameter whose
+# value is the threshold. Those four links are what make attribution generic:
+# "for each factor, read its hw1:statusProperty and look for nodes carrying
+# hw1:Fail under it" finds every failing factor without enumerating a single
+# predicate name. SPARQL did that in v2 and Python does it in v3 -- the wiring is
+# identical and must stay identical, because it is the reason adding a menu
+# factor needs no per-factor branch anywhere in the codebase.
+#
+# THE ACTIVE MENU IS EIGHT: five frame factors and three pair factors. The two
+# run factors are not selectable and are always evaluated.
+#
+# ONE INVARIANT, and it is the one that keeps the arithmetic honest: NO
+# QualityFactor may declare the aggregate hw1:qualificationStatus as its
+# hw1:statusProperty. The aggregate is the conjunction OF the factor statuses; a
+# factor reading it back would double-count itself, and a generic attribution
+# pass would report the aggregate as a failing "factor" with no threshold behind
+# it to fix.
+
+hw1:QualityFactor a rdfs:Class ;
+    rdfs:comment "A measured property of the data with a defined direction and threshold. NOT a DoE factor -- a settable input is a hw1:Parameter. In DoE terms a QualityFactor is a covariate; that collision is why this class is not called Factor. v1 subclassed dqv:Metric; v2 does not, because a factor is now fully defined by the four properties below."@en .
+
+hw1:overProperty a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdf:Property ;
+    rdfs:comment "The observable value property this factor grades. Exactly one per factor."@en .
+hw1:statusProperty a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdf:Property ;
+    rdfs:comment "The baked-status property paired with hw1:overProperty. Its local name is always the value property's plus \"Status\", but code must READ this link rather than concatenate the string -- concatenation is how a reader silently stops matching a factor added later. Never hw1:qualificationStatus: that is the aggregate OVER these, not one of them."@en .
+hw1:polarity a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range hw1:Polarity ;
+    rdfs:comment "Which side of the threshold passes. Read by the status rule, so the rule is one branch instead of one branch per factor."@en .
+hw1:qualifiedBy a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range hw1:Parameter ;
+    rdfs:comment "The QualificationSetting parameter whose settingValue is this factor's threshold. Exactly one per factor: a factor with two thresholds is two factors."@en .
+hw1:appliesTo a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdfs:Class ;
+    rdfs:comment "Which node class carries hw1:overProperty -- FrameAnnotation, FramePair or ReconstructionRun. Documentation for a reader choosing a join path, and the honest way to tell a selectable input-quality factor from an always-on run factor: hw1:appliesTo hw1:ReconstructionRun means not selectable."@en .
+
+# ---- frame factors ----
+
+hw1:HighFrequencyDepthResidual a hw1:QualityFactor ;
+    rdfs:label "high-frequency depth residual"@en ;
+    hw1:overProperty hw1:highFrequencyDepthResidual ;
+    hw1:statusProperty hw1:highFrequencyDepthResidualStatus ;
+    hw1:polarity hw1:LowerIsBetter ;
+    hw1:qualifiedBy hw1:maxHighFrequencyDepthResidual ;
+    hw1:appliesTo hw1:FrameAnnotation .
+
+hw1:FlyingPixelRatio a hw1:QualityFactor ;
+    rdfs:label "flying pixel ratio"@en ;
+    hw1:overProperty hw1:flyingPixelRatio ;
+    hw1:statusProperty hw1:flyingPixelRatioStatus ;
+    hw1:polarity hw1:LowerIsBetter ;
+    hw1:qualifiedBy hw1:maxFlyingPixelRatio ;
+    hw1:appliesTo hw1:FrameAnnotation .
+
+hw1:ValidTileCoverage a hw1:QualityFactor ;
+    rdfs:label "valid tile coverage"@en ;
+    hw1:overProperty hw1:validTileCoverage ;
+    hw1:statusProperty hw1:validTileCoverageStatus ;
+    hw1:polarity hw1:HigherIsBetter ;
+    hw1:qualifiedBy hw1:minValidTileCoverage ;
+    hw1:appliesTo hw1:FrameAnnotation .
+
+hw1:HighlightClipping a hw1:QualityFactor ;
+    rdfs:label "highlight clipping"@en ;
+    hw1:overProperty   hw1:clipHiFraction ;
+    hw1:statusProperty hw1:clipHiFractionStatus ;
+    hw1:polarity       hw1:LowerIsBetter ;
+    hw1:qualifiedBy    hw1:maxClipHiFraction ;
+    hw1:appliesTo      hw1:FrameAnnotation .
+
+hw1:ShadowClipping a hw1:QualityFactor ;
+    rdfs:label "shadow clipping"@en ;
+    hw1:overProperty   hw1:clipLoFraction ;
+    hw1:statusProperty hw1:clipLoFractionStatus ;
+    hw1:polarity       hw1:LowerIsBetter ;
+    hw1:qualifiedBy    hw1:maxClipLoFraction ;
+    hw1:appliesTo      hw1:FrameAnnotation .
+
+# ---- pair factors ----
+
+hw1:IdentityMedianDepthChange a hw1:QualityFactor ;
+    rdfs:label "identity median depth change"@en ;
+    hw1:overProperty hw1:identityMedianDepthChange ;
+    hw1:statusProperty hw1:identityMedianDepthChangeStatus ;
+    hw1:polarity hw1:LowerIsBetter ;
+    hw1:qualifiedBy hw1:maxIdentityMedianDepthChange ;
+    hw1:appliesTo hw1:FramePair .
+
+hw1:JointValidDepthRatio a hw1:QualityFactor ;
+    rdfs:label "joint valid depth ratio"@en ;
+    hw1:overProperty hw1:jointValidDepthRatio ;
+    hw1:statusProperty hw1:jointValidDepthRatioStatus ;
+    hw1:polarity hw1:HigherIsBetter ;
+    hw1:qualifiedBy hw1:minJointValidDepthRatio ;
+    hw1:appliesTo hw1:FramePair .
+
+hw1:PriorWarpDepthResidual a hw1:QualityFactor ;
+    rdfs:label "prior-warp depth residual"@en ;
+    hw1:overProperty hw1:priorWarpDepthResidual ;
+    hw1:statusProperty hw1:priorWarpDepthResidualStatus ;
+    hw1:polarity hw1:LowerIsBetter ;
+    hw1:qualifiedBy hw1:maxPriorWarpDepthResidual ;
+    hw1:appliesTo hw1:FramePair .
+
+# ---- run factors (new in v2) ----
+# These are what close the loop. A failing hw1:ReconstructionAccuracy is the
+# symptom the student starts from; `explore`'s verdict section walks from it to
+# the frame and pair factors that failed underneath it, and from those to the
+# culprit setting and its role.
+#
+# NEITHER IS SELECTABLE (§4.2). A declaration naming one in
+# hw1:evaluatesFactor is an error, and both are evaluated on every experiment
+# whether or not the student thought about them -- which is also why their three
+# parameters (icpBackend, maxMapMeanL2, minCoverageF) are in
+# every required setting vector regardless of the selection. Selection scopes the
+# INPUTS; the outcome is not up for negotiation.
+
+hw1:ReconstructionAccuracy a hw1:QualityFactor ;
+    rdfs:label "reconstruction trajectory accuracy"@en ;
+    hw1:overProperty   hw1:mapMeanL2 ;
+    hw1:statusProperty hw1:mapMeanL2Status ;
+    hw1:polarity       hw1:LowerIsBetter ;
+    hw1:qualifiedBy    hw1:maxMapMeanL2 ;
+    hw1:appliesTo      hw1:ReconstructionRun .
+
+hw1:Coverage a hw1:QualityFactor ;
+    rdfs:label "coverage"@en ;
+    hw1:overProperty   hw1:coverageF ;
+    hw1:statusProperty hw1:coverageFStatus ;
+    hw1:polarity       hw1:HigherIsBetter ;
+    hw1:qualifiedBy    hw1:minCoverageF ;
+    hw1:appliesTo      hw1:ReconstructionRun ;
+    rdfs:comment "Paired with ReconstructionAccuracy on purpose: mean L2 alone is gameable by reconstructing a small confident fragment and discarding the rest, which is exactly what aggressive frame selection does."@en .
+
+
+# =============================================================================
+# 7. Settings -- one parameter at one value, for one batch or one experiment
+# =============================================================================
+# W3C n-ary relation Pattern 1 again. The setting cannot be a plain triple on the
+# Batch or Experiment (`<exp> hw1:tauHi 250.0`) because attribution needs to read
+# the parameter's ROLE off the same node as its value, and because two settings
+# of the same parameter at different values must be distinguishable nodes rather
+# than two contradictory triples on one subject.
+#
+# A v3 experiment's settings come from TWO PLACES and the file itself records
+# which (§4.2): the student writes overrides above the marker, and
+# `experiment` records every remaining REQUIRED parameter from its
+# hw1:paramDefault below it. Given-versus-defaulted is therefore recoverable from
+# which side of the marker a setting sits on -- no flag on the node says it, and
+# none should, because a flag could disagree with the file.
+#
+# STUDENT SETTINGS MAY BE BLANK NODES. The declaration in §4.2 writes
+# them as `[ a hw1:FactorSetting ; ... ]`, and only machine-minted settings must
+# use the IRI scheme of §2. That is legal precisely because nothing
+# ever re-opens a setting node to add triples to it -- see hw1:settingForFactor.
+
+hw1:FactorSetting a rdfs:Class ;
+    rdfs:comment "One parameter at one value, in one context. Replaces v1's hw1:KnobSetting and, because a threshold is now just a parameter, also replaces v1's Band intervals. Written by the student (blank node or any IRI, above the marker) or minted by `experiment` from the parameter's default (scheme IRI, below it)."@en .
+
+hw1:settingParameter a rdf:Property ; rdfs:domain hw1:FactorSetting ; rdfs:range hw1:Parameter ;
+    rdfs:comment "Which declared parameter this sets. The object is a hw1:Parameter INDIVIDUAL, not an rdf:Property -- v1 punned its knobs as both and the pun bought nothing once parameters stopped appearing as predicates."@en .
+hw1:settingRole a rdf:Property ; rdfs:domain hw1:FactorSetting ; rdfs:range hw1:SettingRole ;
+    rdfs:comment "Copied from the parameter's hw1:paramRole when the setting is written, and validated against it on a student-authored setting: a role that disagrees with the parameter's is a hard error, not a local override. Denormalised on purpose: attribution then reads the verdict off the setting node it already has, with no extra hop into the TBox."@en .
+hw1:settingForFactor a rdf:Property ; rdfs:domain hw1:FactorSetting ; rdfs:range hw1:QualityFactor ;
+    rdfs:comment "SINGLE-VALUED since v3: the parameter's hw1:paramPrimaryFactor, and nothing else. On a student-authored setting it must equal that primary factor or the declaration is an error. It is also the <factor> segment of a machine-minted setting's IRI. v2 duplicated the parameter's hw1:paramAffectsFactor links onto every setting node so that a single node carried the full blame set -- v3 deletes that duplication and has readers traverse the TBox instead: setting -> hw1:settingParameter -> hw1:paramPrimaryFactor / hw1:paramAffectsFactor. Same reach, one source of truth, and one thing more: a total blame set had to be WRITTEN onto the node, which meant a machine pass re-opening a setting subject -- impossible for someone else's blank node. Traversal is what makes blank-node student settings legal (§4.5)."@en .
+hw1:settingValue a rdf:Property ; rdfs:domain hw1:FactorSetting ;
+    rdfs:comment "The level. Deliberately NO rdfs:range: it is xsd:double, xsd:integer or xsd:string according to the parameter's hw1:paramValueKind, and a student-authored literal is validated against that kind. Read the kind, never guess the type from the text of the value -- that is what makes icpBackend an ordinary parameter instead of a special case."@en .
+
+hw1:hasGenerationSetting a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range hw1:FactorSetting ;
+    rdfs:comment "Generation settings hang off the BATCH, because they describe the pixels and survive every re-measurement of them. An experiment never declares one; `explore`'s verdict section reads them out of batch.ttl when a Generation parameter is the culprit."@en .
+hw1:hasFactorSetting a rdf:Property ; rdfs:domain hw1:Experiment ; rdfs:range hw1:FactorSetting ;
+    rdfs:comment "Measurement and Qualification settings hang off the EXPERIMENT, because they describe this assessment. Asserted from BOTH sides of the machine marker -- the student's overrides above it, the defaulted remainder below -- which is legal because re-opening a subject across the marker is ordinary Turtle. The resulting vector is total OVER THE SELECTION (§4.2): every required parameter is present exactly once, and nothing the selection did not touch is recorded at all."@en .
+
+
+# =============================================================================
+# 8. Parameter declarations
+# =============================================================================
+# This list is CLOSED. A parameter named by a declaration's hw1:settingParameter,
+# or by a `--gen NAME=VALUE` on batch2ttl, that is not declared here is a hard
+# error at parse time with the declared list printed, never a silent extra --
+# otherwise a typo becomes a new parameter and produces a quietly different
+# experiment that looks fine.
+#
+# Parameter local names are globally unique across factors, which is why a
+# setting node needs only hw1:settingParameter and no factor qualifier, and why
+# api.read_declaration can key its returned setting vector by local name alone.
+#
+# WHICH of these an experiment must record is the v3 completeness rule
+# (§4.2), and it is driven entirely by hw1:evaluatesFactor: for every
+# selected factor, its hw1:qualifiedBy parameter, plus every Measurement
+# parameter whose hw1:paramPrimaryFactor or hw1:paramAffectsFactor is selected,
+# plus the three run-factor parameters always. The table below is the closed list
+# of what MAY be recorded; the selection decides what MUST be.
+
+hw1:Parameter a rdfs:Class ;
+    rdfs:comment "A settable input. DoE calls this a FACTOR and its value a LEVEL; this vocabulary calls it a Parameter because hw1:QualityFactor already took the word for measured outputs. Replaces v1's hw1:Knob and its two subclasses -- the split moved from the class to hw1:paramRole, which has three values instead of two."@en .
+
+hw1:paramRole a rdf:Property ; rdfs:domain hw1:Parameter ; rdfs:range hw1:SettingRole ;
+    rdfs:comment "Which of the three verdicts this parameter carries when it is the culprit. Also decides where its settings live (Batch for Generation, Experiment otherwise) and whether it is subject to the completeness rule."@en .
+hw1:paramValueKind a rdf:Property ; rdfs:domain hw1:Parameter ; rdfs:range xsd:string ;
+    rdfs:comment "\"double\" | \"integer\" | \"string\". Drives both the parse of a `--gen NAME=VALUE` argument and the datatype of hw1:settingValue -- and therefore the validation of a student-authored setting literal. Declared data, not inferred from the text."@en .
+hw1:paramPrimaryFactor a rdf:Property ; rdfs:domain hw1:Parameter ; rdfs:range hw1:QualityFactor ;
+    rdfs:comment "Single-valued and MANDATORY. The factor this parameter is most directly about. It is the <factor> segment of a machine-minted setting IRI and the only legal value of a setting's hw1:settingForFactor since v3, so it must never be ambiguous."@en .
+hw1:paramAffectsFactor a rdf:Property ; rdfs:domain hw1:Parameter ; rdfs:range hw1:QualityFactor ;
+    rdfs:comment "0..n FURTHER factors whose values move when this parameter moves. Never appears in an IRI. Since v3 this link is read straight off the TBox rather than copied onto setting nodes: it is what lets attribution blame brightnessGain for a ShadowClipping failure even though its primary factor is HighlightClipping."@en .
+hw1:paramDefault a rdf:Property ; rdfs:domain hw1:Parameter ;
+    rdfs:comment "Level recorded below the machine marker when a required parameter is not given in the declaration. Deliberately NO rdfs:range, for the same reason as hw1:settingValue: the datatype follows hw1:paramValueKind (\"double\" -> xsd:double, \"integer\" -> xsd:integer, \"string\" -> xsd:string) and is always written out explicitly, never left as a bare Turtle literal. ABSENCE IS MEANINGFUL -- see the Generation parameters below."@en .
+
+# ---- Measurement parameters: change how pixels are scored, never the pixels ----
+
+hw1:tauHi a hw1:Parameter ;
+    rdfs:label "tau hi"@en ;
+    hw1:paramRole          hw1:MeasurementSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:HighlightClipping ;
+    hw1:paramDefault       "250.0"^^xsd:double ;
+    rdfs:comment "Highlight-clipping threshold on max(R,G,B), 0-255. 250 is 98% of full scale, the MATLAB makehdr constant -- a constant of the 8-bit pipeline, not a per-batch derived number. It stays a parameter purely as a sensitivity axis."@en .
+
+hw1:tauLo a hw1:Parameter ;
+    rdfs:label "tau lo"@en ;
+    hw1:paramRole          hw1:MeasurementSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:ShadowClipping ;
+    hw1:paramDefault       "5.0"^^xsd:double ;
+    rdfs:comment "Shadow-clipping threshold on max(R,G,B), 0-255. 5 is 2% of full scale, the other half of the MATLAB makehdr pair -- same status as hw1:tauHi."@en .
+
+hw1:residualMaskK a hw1:Parameter ;
+    rdfs:label "residual mask multiplier"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:HighFrequencyDepthResidual ;
+    hw1:paramDefault "5.0"^^xsd:double .
+
+hw1:flyingPixelWindow a hw1:Parameter ;
+    rdfs:label "flying pixel window"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "integer" ;
+    hw1:paramPrimaryFactor hw1:FlyingPixelRatio ;
+    hw1:paramDefault "5"^^xsd:integer .
+
+hw1:flyingPixelPlanarityTol a hw1:Parameter ;
+    rdfs:label "flying pixel planarity tolerance"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:FlyingPixelRatio ;
+    hw1:paramDefault "0.03"^^xsd:double ; qudt:unit unit:M .
+
+hw1:tileSize a hw1:Parameter ;
+    rdfs:label "tile size"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "integer" ;
+    hw1:paramPrimaryFactor hw1:ValidTileCoverage ;
+    hw1:paramDefault "64"^^xsd:integer .
+
+hw1:tileValidFloor a hw1:Parameter ;
+    rdfs:label "tile valid-return floor"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:ValidTileCoverage ;
+    hw1:paramDefault "0.5"^^xsd:double .
+
+hw1:changeMaskK a hw1:Parameter ;
+    rdfs:label "depth-change mask multiplier"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:IdentityMedianDepthChange ;
+    hw1:paramDefault "3.0"^^xsd:double .
+
+hw1:priorWarpDepthGate a hw1:Parameter ;
+    rdfs:label "prior-warp depth gate"@en ;
+    hw1:paramRole hw1:MeasurementSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:PriorWarpDepthResidual ;
+    hw1:paramDefault "0.10"^^xsd:double ; qudt:unit unit:M .
+
+# icpBackend is the reason hw1:paramValueKind exists. In v1 a categorical level
+# needed its own predicate (hw1:knobLabel) beside the numeric one; here it is an
+# ordinary parameter whose kind happens to be "string".
+hw1:icpBackend a hw1:Parameter ;
+    rdfs:label "icp backend"@en ;
+    hw1:paramRole          hw1:MeasurementSetting ;
+    hw1:paramValueKind     "string" ;
+    hw1:paramPrimaryFactor hw1:ReconstructionAccuracy ;
+    hw1:paramDefault       "open3d"^^xsd:string ;
+    rdfs:comment "Which registration implementation reconstruct.py runs; exactly two legal values, \"open3d\" and \"my_icp\". The recorded setting is authoritative -- a disagreeing --version is a hard error, not a silent override, because the experiment file already states which backend its run values belong to and a silent switch would put two backends' numbers under one name."@en .
+
+# hw1:minSegmentLength IS DELETED (2026-07-31, owner). It declared a shortest
+# usable-link segment, in frames, that the selected run would reconstruct -- a
+# floor justified by the constant-velocity prior needing frames to average over.
+# That justification is a statement about the ICP backend, not about the quality
+# of the pixels, and this vocabulary describes the pixels. Measured on floor 1 it
+# also did nothing it claimed: the selected runs lose to the full batch at every
+# floor (report.md 6), because the cost is the segment SEAMS, which a length
+# floor does not touch. The selected run is now every maximal chain of usable
+# links, whatever its length; see hw1:GoodSegments.
+
+# ---- Qualification parameters: where the Pass line sits ----
+# These are the individuals that replaced v1's Band intervals. Because they are
+# per-experiment settings rather than global individuals, strictness is a
+# treatment axis: sweeping a threshold is the same shell loop as sweeping tauHi.
+#
+# Every number below is the v1 Bad-boundary, course-calibrated, and PROVISIONAL
+# until the OFAT re-cut of plan.md 5 step 3.2/3.3 lands.
+
+hw1:maxClipHiFraction a hw1:Parameter ;
+    rdfs:label "max clip hi fraction"@en ;
+    hw1:paramRole          hw1:QualificationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:HighlightClipping ;
+    hw1:paramDefault       "0.05"^^xsd:double .
+
+hw1:maxClipLoFraction a hw1:Parameter ;
+    rdfs:label "max clip lo fraction"@en ;
+    hw1:paramRole          hw1:QualificationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:ShadowClipping ;
+    hw1:paramDefault       "0.30"^^xsd:double .
+
+hw1:maxHighFrequencyDepthResidual a hw1:Parameter ;
+    rdfs:label "max high-frequency depth residual"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:HighFrequencyDepthResidual ;
+    hw1:paramDefault "0.05"^^xsd:double ; qudt:unit unit:M .
+
+hw1:maxFlyingPixelRatio a hw1:Parameter ;
+    rdfs:label "max flying pixel ratio"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:FlyingPixelRatio ;
+    hw1:paramDefault "0.05"^^xsd:double .
+
+hw1:minValidTileCoverage a hw1:Parameter ;
+    rdfs:label "min valid tile coverage"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:ValidTileCoverage ;
+    hw1:paramDefault "0.50"^^xsd:double .
+
+hw1:maxIdentityMedianDepthChange a hw1:Parameter ;
+    rdfs:label "max identity median depth change"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:IdentityMedianDepthChange ;
+    hw1:paramDefault "0.20"^^xsd:double ; qudt:unit unit:M .
+
+hw1:minJointValidDepthRatio a hw1:Parameter ;
+    rdfs:label "min joint valid depth ratio"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:JointValidDepthRatio ;
+    hw1:paramDefault "0.30"^^xsd:double .
+
+hw1:maxPriorWarpDepthResidual a hw1:Parameter ;
+    rdfs:label "max prior-warp depth residual"@en ;
+    hw1:paramRole hw1:QualificationSetting ;
+    hw1:paramValueKind "double" ;
+    hw1:paramPrimaryFactor hw1:PriorWarpDepthResidual ;
+    hw1:paramDefault "0.10"^^xsd:double ; qudt:unit unit:M .
+
+hw1:maxMapMeanL2 a hw1:Parameter ;
+    rdfs:label "max trajectory mean L2 (legacy parameter name)"@en ;
+    hw1:paramRole          hw1:QualificationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:ReconstructionAccuracy ;
+    hw1:paramDefault       "0.80"^^xsd:double ;
+    qudt:unit              unit:M ;
+    rdfs:comment "Re-cut to 0.80 m on 2026-08-03 against the authoritative 193-frame capture: clean full-batch = 0.7217 m and corrupted full-batch = 0.7456 m. Both pass because the observed consumer effect is small; placing a line between them would fabricate discrimination. Selected probes at 3.37-10.25 m still fail with wide margin. The property name is legacy: the measured quantity is camera-trajectory error, not map geometry."@en .
+
+hw1:minCoverageF a hw1:Parameter ;
+    rdfs:label "min coverage F"@en ;
+    hw1:paramRole          hw1:QualificationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:Coverage ;
+    hw1:paramDefault       "0.40"^^xsd:double .
+
+# ---- Generation parameters: describe the pixels ----
+#
+# NONE OF THESE CARRIES hw1:paramDefault, and that is the point. A default
+# would be filled in and recorded on every batch, asserting a brightness gain of
+# 1.0 or a depth noise sigma of 0.0 about pixels this code never touched --
+# a claim nothing verified. Absence here means "NOT ASSERTED", not "identity",
+# and the completeness rule of §4.2 exempts Generation parameters for
+# exactly that reason: they stay batch-only and are recorded only when actually
+# given via --gen. A declaration never sets one -- there is nothing an experiment
+# could do with it, since the pixels already embody it.
+#
+# Their hw1:paramAffectsFactor links are what make the Generation verdict
+# reachable: `explore`'s verdict section walks from a failing HighlightClipping to
+# brightnessGain on the batch and reports role=Generation, i.e. "regenerate the
+# data", rather than pointing at tauHi and sending the student to tune a
+# threshold against pixels that were broken before measurement started.
+
+hw1:brightnessGain a hw1:Parameter ;
+    rdfs:label "brightness gain"@en ;
+    hw1:paramRole          hw1:GenerationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:HighlightClipping ;
+    hw1:paramAffectsFactor hw1:ShadowClipping ;
+    rdfs:comment "Multiplicative RGB gain already baked into a corrupted capture directory. Applied by nothing here; recorded for provenance, because the treatment must be identifiable even when the pixels already embody it. Raising it clips highlights; lowering it crushes shadows -- hence both factors."@en .
+
+hw1:depthNoiseSigma a hw1:Parameter ;
+    rdfs:label "depth noise sigma"@en ;
+    hw1:paramRole          hw1:GenerationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:HighFrequencyDepthResidual ;
+    hw1:paramAffectsFactor hw1:IdentityMedianDepthChange ;
+    qudt:unit              unit:M ;
+    rdfs:comment "Standard deviation, in metres, of the noise already baked into a corrupted depth raster. Applied by nothing here; recorded for provenance. It raises single-frame roughness and, independently, the frame-to-frame median difference."@en .
+
+hw1:depthScale a hw1:Parameter ;
+    rdfs:label "depth scale"@en ;
+    hw1:paramRole          hw1:GenerationSetting ;
+    hw1:paramValueKind     "double" ;
+    hw1:paramPrimaryFactor hw1:IdentityMedianDepthChange ;
+    hw1:paramAffectsFactor hw1:PriorWarpDepthResidual ;
+    rdfs:comment "Multiplicative range-scale corruption already baked into a corrupted depth raster. Applied by nothing here; recorded for provenance. Scaling every valid range shifts the frame's median depth against its neighbours and pulls warped-prior residuals with it -- hence both depth-consistency factors."@en .
+
+hw1:injectedFrameCount a hw1:Parameter ;
+    rdfs:label "injected frame count"@en ;
+    hw1:paramRole          hw1:GenerationSetting ;
+    hw1:paramValueKind     "integer" ;
+    hw1:paramPrimaryFactor hw1:HighFrequencyDepthResidual ;
+    rdfs:comment "Count of glitch frames inserted into the sequence of a corrupted capture directory; the pixels of every real frame are untouched. Applied by nothing here; recorded for provenance. An inserted frame's structureless depth raster has an enormous single-frame roughness estimate -- hence the high-frequency factor."@en .
+
+
+# =============================================================================
+# 9. Deleted in v3 -- nothing dies silently
+# =============================================================================
+# Full ledger of deleted vocabulary that used to be in this file:
+#
+#   hw1:ValidDepthRatio, hw1:DepthRoughness, hw1:DepthConsistency,
+#   hw1:StructureOverlap (and their observables, qualification parameters, and
+#   the depth-window / Sobel measurement parameters that existed only for them)
+#       -> deleted in v4. Replaced by HighFrequencyDepthResidual,
+#          IdentityMedianDepthChange, JointValidDepthRatio and
+#          PriorWarpDepthResidual. Not kept as parse-only TBox individuals.
+#
+#   hw1:frameStatus
+#       -> hw1:qualificationStatus on each of the frame's per-modality
+#          FrameAnnotations, plus the per-frame verdict computed in
+#          api.read_experiment as the conjunction over them. With annotations
+#          split by modality there is no single node left to store a per-frame
+#          status on, and the conjunction was already the only thing anyone read.
+#
+#   hw1:pairStatus
+#       -> hw1:qualificationStatus on the FramePair. Same meaning, same node; it
+#          lost its own name because the carrying node already says what was
+#          aggregated and two names for one idea would have become three when the
+#          per-modality split landed.
+#
+#   hw1:experimentId
+#       -> nothing. Experiment identity is the NAME (§6): the
+#          declaration file's stem, which is also the IRI tail, and which a reader
+#          can print from either without a redundant literal. The 8-hex digest and
+#          its whole canonical-representation apparatus are gone. hw1:declarationDigest
+#          is NOT its replacement -- that digest seals the declaration text against
+#          post-assessment edits and never identifies anything.
+#
+#   multi-valued hw1:settingForFactor (primary + every affected factor)
+#       -> single-valued (primary only) + TBox traversal through
+#          hw1:settingParameter to hw1:paramPrimaryFactor / hw1:paramAffectsFactor.
+#          See the property's own comment: the duplication is what would have
+#          forced a machine pass to re-open a student's blank node.
+#
+# Also gone from the wider system, though never vocabulary in this file: the
+# `query` command, queries/*.rq, the pyoxigraph dependency, and `experiment`'s
+# --batch-dir / --floor / --set / --exp-id / --label / --no-pairs / --out flags.
+# The vocabulary they used all survives; only their consumers changed.
+#
+# The v1 vocabulary that used to be in this file, kept for the same reason:
+#
+#   hw1:Band, hw1:forFactor, hw1:grade, hw1:minInclusive, hw1:maxInclusive,
+#   hw1:gradeRank, hw1:Good, hw1:Marginal, hw1:Bad
+#       -> QualificationSetting parameters + baked binary hw1:Pass / hw1:Fail.
+#          ontology/bands.ttl is removed from the tree.
+#
+#   hw1:Knob, hw1:MeasurementKnob, hw1:CorruptionKnob, hw1:KnobSetting,
+#   hw1:setsKnob, hw1:knobValue, hw1:knobLabel, hw1:knobValueKind,
+#   hw1:defaultValue, hw1:hasKnobSetting
+#       -> hw1:Parameter, hw1:FactorSetting, three hw1:SettingRole individuals,
+#          hw1:paramValueKind, hw1:paramDefault. A parameter is a named
+#          individual now and no longer an rdf:Property, so the v1 pun is gone.
+#
+#   hw1:parameterisedBy
+#       -> hw1:paramPrimaryFactor / hw1:paramAffectsFactor. Same edge, declared
+#          from the parameter side, where it can be mandatory and single-valued.
+#
+#   hw1:hasNextFrame
+#       -> hw1:frameIndex / hw1:pairIndex ordering. A successor chain in the
+#          batch file forced pair skeletons to live there too.
+#
+#   hw1:fromFrame, hw1:toFrame
+#       -> hw1:sourceFrame, hw1:targetFrame (§4.3).
+#
+#   hw1:Result, hw1:ResultMeasure, hw1:hasResult, hw1:MapMeanL2, hw1:CoverageF,
+#   dqv:Metric / dqv:QualityMeasurement / dqv:expectedDataType
+#       -> hw1:ReconstructionRun with ordinary value+status predicates, graded by
+#          the ordinary QualityFactors hw1:ReconstructionAccuracy and hw1:Coverage.
+#          Reconstruction outcomes and image observables are one mechanism now.
+#
+#   hw1:includesFrame, hw1:selectionCriterion, hw1:minSegmentLength as a predicate
+#       -> hw1:usedFrame on a hw1:GoodSegments run; the criterion is the frozen
+#          usable-link rule in code. minSegmentLength briefly became a
+#          hw1:Parameter in v2/v3 and is now deleted outright -- see the note
+#          where it used to stand, in section 7.
+#
+#   the graph-naming convention comment block
+#       -> section 1 of this file. There are no named graphs.
