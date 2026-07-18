@@ -1,5 +1,7 @@
 # --- project data / envs ---
 outputs
+# Fuseki server binary (downloaded via `pixi run -e fuseki fuseki`)
+hw1/fuseki_bin/
 # pixi environments (rebuilt from pixi.lock via `pixi install`)
 .pixi/
 data_collection/

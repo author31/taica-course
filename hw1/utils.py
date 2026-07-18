@@ -1,7 +1,7 @@
 """
 Geometry-only ICP SLAM utilities for the HW1 robustness/generalization eval.
 
-Split out of the original scripts/reconstruct.py so the reconstruction pipeline
+Split out of the original reconstruction script so the reconstruction pipeline
 can be driven headless (no Open3D window) from the evaluator, while the thin
 hw1/reconstruct.py CLI still imports these for interactive visualisation.
 
@@ -388,7 +388,7 @@ def _rot_angle_deg(R):
 
 def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
                 build_cloud=True, robust=True, gate_trans=0.5, gate_rot=30.0,
-                down_voxel=None):
+                down_voxel=None, frames=None):
     """
     Geometry-only ICP SLAM over the frames under `data_root`.
 
@@ -424,6 +424,21 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
         down_voxel : if set (and build_cloud), voxel-downsample each frame's world
                     cloud before accumulating so the global map stays small (the
                     coverage/F-score eval needs the cloud, not the full ~10^8 pts).
+        frames    : optional list of integer frame stems (ascending) selected
+                    upstream (e.g. an ontology/SPARQL query written to a CSV). When
+                    None (default), behaviour is EXACTLY as before: glob every .png
+                    under rgb/ and depth/ via _sorted_frames. When given, ONLY those
+                    stems are used, in the given order: rgb/depth path lists are
+                    built as data_root/rgb/<stem>.png and data_root/depth/<stem>.png,
+                    and the whole pipeline (pairwise registration, constant-velocity
+                    prior, accumulation) runs over this reduced ordered sequence. GT
+                    rows are subset by the SAME stems (gt_all[frames]) so pred/GT
+                    stay index-aligned.
+                    NOTE: dropping interior frames WIDENS per-step motion. The
+                    constant-velocity prior and the gate_trans/gate_rot plausibility
+                    gate both assume CONSECUTIVE frames (~0.09 m / ~6 deg/step), so
+                    large gaps between selected stems degrade accuracy — this is
+                    expected behaviour of a subset, not a bug.
 
     Returns:
         (global_pcd, pred_cam_pos, gt_poses)
@@ -465,9 +480,17 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
     rgb_dir   = os.path.join(data_root, 'rgb')
     depth_dir = os.path.join(data_root, 'depth')
 
-    rgb_files   = _sorted_frames(rgb_dir)
-    depth_files = _sorted_frames(depth_dir)
-    n_frames    = min(len(rgb_files), len(depth_files))
+    if frames is None:
+        # Default: every .png under rgb/ and depth/, numeric-sorted (unchanged).
+        rgb_files   = _sorted_frames(rgb_dir)
+        depth_files = _sorted_frames(depth_dir)
+        n_frames    = min(len(rgb_files), len(depth_files))
+    else:
+        # Subset: use ONLY the given stems, in the given order.
+        frames      = [int(s) for s in frames]
+        rgb_files   = [f"{s}.png" for s in frames]
+        depth_files = [f"{s}.png" for s in frames]
+        n_frames    = len(frames)
     if verbose:
         print(f"[reconstruct] {data_root}: {n_frames} frames | version={version}")
 
@@ -484,7 +507,7 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
 
     n = len(pcds)
     if n == 0:
-        return o3d.geometry.PointCloud(), np.zeros((0, 3)), _load_gt(data_root)
+        return o3d.geometry.PointCloud(), np.zeros((0, 3)), _load_gt(data_root, frames)
 
     # ── Sequential pairwise registration ────────────────────────────────────
     def _maybe_down(p):
@@ -553,15 +576,25 @@ def reconstruct(data_root, version="open3d", voxel_size=0.05, verbose=True,
             global_pcd += pcd
     pred_cam_pos = np.array(pred_cam_pos, dtype=np.float64)
 
-    return global_pcd, pred_cam_pos, _load_gt(data_root)
+    return global_pcd, pred_cam_pos, _load_gt(data_root, frames)
 
 
-def _load_gt(data_root):
-    """Load data_root/GT_pose.npy (the (M,7) GT pose array), or None if absent."""
+def _load_gt(data_root, frames=None):
+    """Load data_root/GT_pose.npy (the (M,7) GT pose array), or None if absent.
+
+    When `frames` (a list of integer stems) is given, subset the GT rows by those
+    SAME stems (row i <-> frame i in the original capture order) so the returned GT
+    stays index-aligned with a reconstruction run over the frame subset. Stems out
+    of range for the GT array are skipped safely, preserving the given order.
+    """
     gt_path = os.path.join(data_root, 'GT_pose.npy')
     if not os.path.exists(gt_path):
         return None
-    return np.load(gt_path)
+    gt = np.load(gt_path)
+    if frames is None:
+        return gt
+    stems = [int(s) for s in frames if 0 <= int(s) < len(gt)]
+    return gt[stems]
 
 
 def mean_l2(pred_cam_pos, gt_poses):

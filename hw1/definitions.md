@@ -1,9 +1,17 @@
-# Data-Quality Definitions — Two Floors
+# Data-Quality Definitions — Empirical Bands + Temporal-Window Regime
 
 Empirically derived data-quality ranges for the geometry-only robust-ICP SLAM pipeline
 (`hw1/utils.reconstruct`). These are **pipeline-specific thresholds**: conventions valid for *this*
-pipeline + coupling only, not transferable scientific constants. Produced by `autoresearch.py`
-via OFAT sweeps.
+pipeline + coupling only, not transferable scientific constants.
+
+> **Regime note.** The bands below were derived under the **legacy one-effect-per-config
+> (OFAT) regime** by an `autoresearch.py` sweep harness that is **not committed to this repo**
+> (see [Provenance](#provenance-historical)). The pipeline has since moved to **seeded temporal
+> uncertainty windows** injected live during a single-config run (see
+> [Temporal-window regime (current)](#temporal-window-regime-current)). The threshold *numbers*
+> are retained verbatim: they remain the `hw1/api.py THRESHOLDS` defaults, and the floor-1 band
+> is the reference the synthetic ontology test (`hw1/test_e2e.py`) grades against. The first
+> floor itself no longer has a config, eval data, or a committed trajectory.
 
 - **Metric:** coverage-aware correctness F-score (`hw1/completeness.py`, F = 2AC/(A+C), τ = 0.10 m, higher is better)
 - **Pass rule:** `F >= keep * F(axis_neutral)`, `keep = 0.5` (relative to per-axis neutral reference)
@@ -11,12 +19,12 @@ via OFAT sweeps.
 
 ## Summary
 
-| Definition | Observable | First floor | Second floor |
+| Definition | Observable | First floor (archived) | Second floor |
 |---|---|---|---|
 | GoodBrightnessRange | `avg_luma_rec601` | **[146, 231]** (brightness 0.5–1.0) | *degenerate* — [18, 253] (full sweep) |
 | ValidDepthRatio | `valid_depth_fraction` | **≥ 0.570** (max_range ≥ 2.0 m) | **≥ 0.493** (max_range ≥ 1.0 m) |
 
-Clean baseline F: first floor **0.505**, second floor **0.240**.
+Clean baseline F at derivation time: first floor **0.505**, second floor **0.240**.
 
 ## API threshold table
 
@@ -30,7 +38,13 @@ Single source of truth mirrored by `hw1/api.py THRESHOLDS`. Exact values:
 Only brightness + valid-depth are API-serviceable (single-sample computable); the noise axis is
 excluded (needs a clean-depth reference).
 
-## First floor (`trajectories/firstfloor.npy`)
+## First floor — ARCHIVED (synthetic-test reference)
+
+> **Historical.** The first floor was dropped from configs / eval data / trajectories; its
+> derivation trajectory (`trajectories/firstfloor.npy`) is not in the repo. The numbers are kept
+> **unchanged** because they are load-bearing: `api.py THRESHOLDS[1]` defaults, the floor-1
+> individuals in `ontology/hw1.ttl`, and `hw1/test_e2e.py`'s deterministic PASS/FAIL fixture all
+> depend on exactly this band. Do not edit them without re-deriving the whole set.
 
 Clean baseline F = 0.505.
 
@@ -43,7 +57,9 @@ Both axes give clean, non-degenerate bands. Brightness fails on both dark and br
 
 ## Second floor (`trajectories/secondfloor.npy`)
 
-Clean baseline F = 0.240 (harsher scene — lower ceiling F across all axes).
+The active floor — `trajectories/secondfloor.npy` (454 poses) is committed and drives
+`scripts/evaluate.py`. Clean baseline F at derivation time = 0.240 (harsher scene — lower
+ceiling F across all axes).
 
 | Definition | Observable range | Knob range | Axis-neutral F | Threshold |
 |---|---|---|---|---|
@@ -55,6 +71,11 @@ Clean baseline F = 0.240 (harsher scene — lower ceiling F across all axes).
 side / high side", band = full sweep range. The definition is **not usable** on this floor: the
 scene is too far from the ICP working point for the brightness coupling to produce a measurable
 cliff above the noise floor. Depth-ratio axis remains well-formed.
+
+**Consequence under the current regime:** the ontology gate cannot detect the injected
+brightness-type windows (flicker / low_light / over_exposure) on floor 2 — only the
+valid-depth axis gates there, via the light→depth coupling. The window ground truth lives in
+`windows.json` (below), outside the store.
 
 ## Why no depth-noise definition
 
@@ -71,16 +92,52 @@ and thus API-serviceable.
 - **Brightness** does **not** generalize — clean on floor 1, degenerate on floor 2. Cross-scene brightness
   thresholds need either a per-scene neutral calibration or a stronger coupling gain tuned to the harsher scene.
 
-## Provenance
+## Temporal-window regime (current)
 
-- Script: `autoresearch.py`
-- Results: `research_out/results.csv` (floor 1), `research_out_secondfloor/results.csv` (floor 2)
-- Curves: `research_out/curve_*.png`, `research_out_secondfloor/curve_*.png`
-- Definitions: `research_out/definitions.yaml`, `research_out_secondfloor/definitions.yaml`
+Uncertainties are no longer one-effect-per-config. The single config
+(`hw1/configs/second_floor.yaml`, `uncertainties:` block) seeds an `UncertaintyScheduler`
+(`packages/simulator`) that lazily draws an endless deterministic stream —
+`gap_s → duration_s → effect type → repeat` (seconds, uniform per draw) — so any run contains
+**temporal windows** of flicker / low_light / over_exposure at fixed per-type severity. One seed
+governs both the window sampling and the per-frame depth RNG; frames outside every window are
+bit-identical to a clean run.
 
-## Reproduce
+- **Interactive collection** (`hw1/load.py`): t = wall-clock seconds since session start —
+  windows fire live; `--clean` disables the scheduler.
+- **Replay / evaluate** (`scripts/evaluate.py`): t = frame_index / fps (default 30) —
+  deterministic. Evaluate does a two-run flow from the one config: scheduler OFF →
+  `eval/_data/second_floor/baseline/`, ON → `eval/_data/second_floor/mixed/`.
 
-Run from repo root:
+### Window ground truth — `windows.json`
 
-- Floor 1: `pixi run -e habitat python autoresearch.py --trajectory trajectories/firstfloor.npy`
-- Floor 2: `pixi run -e habitat python autoresearch.py --trajectory trajectories/secondfloor.npy --out-dir research_out_secondfloor`
+Whenever the scheduler ran, the realized windows are serialized to
+`<capture_root>/windows.json` (e.g. `eval/_data/second_floor/mixed/windows.json`). This file is
+the **authoritative record of when effects were active**; it is kept deliberately **outside**
+the triplestore (the ontology holds per-frame observables only), so cross-referencing gate
+PASS/FAIL against windows is offline analysis, not SPARQL. Schema — a JSON list, times in
+seconds:
+
+```json
+[
+  {
+    "start_s": 3.1203,
+    "end_s": 5.5037,
+    "type": "over_exposure",
+    "params": { "brightness": 2.2, "contrast": 1.2 }
+  }
+]
+```
+
+`evaluate.py` maps each window to 1-indexed frame bounds via
+`frame = round(t_s * fps)` (replay time base `t = i / fps`) for the per-window rows in
+`eval/per_window.csv`.
+
+## Provenance (historical)
+
+The derivation harness and its outputs are **not committed to this repo**: `autoresearch.py`
+(OFAT sweep script), `trajectories/firstfloor.npy`, and the `research_out/` /
+`research_out_secondfloor/` result trees (results.csv, curve_*.png, definitions.yaml) existed
+only in the original derivation workspace. The historical invocations were
+`autoresearch.py --trajectory trajectories/{firstfloor,secondfloor}.npy`; they cannot be re-run
+from this repo. The tables above are therefore a **recorded convention**, mirrored in code by
+`hw1/api.py THRESHOLDS` and regression-locked by `hw1/test_e2e.py`.

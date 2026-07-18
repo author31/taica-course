@@ -1,16 +1,26 @@
 """
-Thin CLI over hw1/utils.py: reconstruct ONE floor's captured run (geometry-only
-ICP SLAM), print the mean L2 vs ground truth, and open an Open3D window with the
-reconstructed cloud + estimated (red) and GT (black) trajectories.
+Thin CLI over hw1/utils.py: reconstruct ONE captured run (a dir holding
+rgb/ depth/ GT_pose.npy) with geometry-only ICP SLAM, print the mean L2 vs
+ground truth, and open an Open3D window with the reconstructed cloud +
+estimated (red) and GT (black) trajectories.
 
 The heavy lifting lives in utils.py so the evaluator can run headless. This file
 is the interactive/visual entry point only.
 
-    pixi run -e habitat python hw1/reconstruct.py --data_root eval/_data/first_floor/baseline/
-    pixi run -e habitat python hw1/reconstruct.py --floor 1 --version open3d
+    pixi run -e habitat python hw1/reconstruct.py --data_root eval/_data/second_floor/baseline/
+    pixi run -e habitat python hw1/reconstruct.py --data_root eval/_data/second_floor/mixed/ --version open3d
+    pixi run -e habitat python hw1/reconstruct.py --data_root eval/_data/second_floor/baseline/ --frames-csv valid_frames.csv
+
+--frames-csv restricts the reconstruction to the frame subset selected upstream by
+hw1/api.py retrieve (an ontology/SPARQL query). The CSV header is
+`frame,rgb_path,depth_path,luma,valid_fraction`; only the integer `frame` column is
+read here (paths are reconstructed from --data_root + stem). Dropping interior frames
+widens per-step motion, which the constant-velocity SLAM prior expects to be small,
+so large gaps degrade accuracy — see utils.reconstruct's `frames` note.
 """
 import os
 import sys
+import csv
 import time
 import argparse
 
@@ -23,22 +33,33 @@ import utils
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--floor', type=int, default=1)
     parser.add_argument('-v', '--version', type=str, default='open3d',
                         help='open3d or my_icp')
-    parser.add_argument('--data_root', type=str, default=None,
-                        help='explicit capture dir (overrides --floor default)')
+    parser.add_argument('--data_root', type=str,
+                        default=os.path.join("eval", "_data", "second_floor",
+                                             "baseline"),
+                        help='capture dir to reconstruct (rgb/ depth/ GT_pose.npy)')
     parser.add_argument('--no-vis', action='store_true',
                         help='skip the Open3D window (print metric only)')
+    parser.add_argument('--frames-csv', type=str, default=None,
+                        help='CSV (frame,rgb_path,depth_path,luma,valid_fraction) '
+                             'selecting a frame subset; only the `frame` column is '
+                             'used, sorted ascending')
     args = parser.parse_args()
 
     data_root = args.data_root
-    if data_root is None:
-        data_root = ("eval/_data/first_floor/baseline" if args.floor == 1
-                     else "sample_data_collection/second_floor/")
+
+    frames = None
+    if args.frames_csv is not None:
+        with open(args.frames_csv, newline='') as fh:
+            rows = list(csv.DictReader(fh))
+        frames = sorted(int(r["frame"]) for r in rows)
+        print(f"[reconstruct] frame subset from {args.frames_csv}: "
+              f"{len(frames)} frames")
 
     t0 = time.time()
-    result_pcd, pred_cam_pos, gt_poses = utils.reconstruct(data_root, args.version)
+    result_pcd, pred_cam_pos, gt_poses = utils.reconstruct(
+        data_root, args.version, frames=frames)
 
     l2 = utils.mean_l2(pred_cam_pos, gt_poses)
     n = 0 if gt_poses is None else min(len(pred_cam_pos), len(gt_poses))

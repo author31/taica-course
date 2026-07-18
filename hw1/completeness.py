@@ -28,10 +28,13 @@ FRAME MISMATCH — handled by ONE known transform (no fitting)
     (an alignment fit would hide that drift; anchoring keeps the score honest).
 
 GT REFERENCE
-    The whole-floor map is built from the floor's *baseline* (clean) capture:
-    every frame is unprojected and placed with its GROUND-TRUTH pose (same anchor
-    math, per frame). It is fixed and independent of what a student collected, so
-    a 5-frame submission is scored against the entire apartment.
+    The whole-floor map is built from the *baseline* (clean, scheduler-off)
+    capture of evaluate.py's two-run flow — eval/_data/second_floor/baseline/ —
+    NEVER from the uncertainty-corrupted mixed/ capture (build_gt_reference
+    rejects a mixed/ dir outright). Every frame is unprojected and placed with
+    its GROUND-TRUTH pose (same anchor math, per frame). It is fixed and
+    independent of what a student collected, so a 5-frame submission is scored
+    against the entire apartment.
 """
 
 import os
@@ -74,7 +77,17 @@ def _apply(T, pts):
 
 def build_gt_reference(baseline_root, stride=4, voxel=0.03):
     """Whole-floor GT map: unproject every `stride`-th baseline frame and place it
-    with its ground-truth pose. Returns an o3d.geometry.PointCloud (world frame)."""
+    with its ground-truth pose. Returns an o3d.geometry.PointCloud (world frame).
+
+    `baseline_root` must be a BASELINE (clean, scheduler-off) capture dir from
+    evaluate.py's two-run flow. Pointing it at the uncertainty-corrupted mixed/
+    capture would poison the reference every score is measured against, so a
+    dir whose basename is "mixed" is rejected."""
+    base = os.path.basename(os.path.normpath(baseline_root))
+    if base == "mixed":
+        raise ValueError(
+            f"build_gt_reference must consume a baseline/ capture, got {baseline_root!r} "
+            "— the mixed/ (uncertainty-corrupted) run must never feed the GT reference")
     gt = np.load(os.path.join(baseline_root, "GT_pose.npy"))
     rgb_dir = os.path.join(baseline_root, "rgb")
     dep_dir = os.path.join(baseline_root, "depth")
