@@ -1,0 +1,36 @@
+@prefix hw1:  <http://taica.course/hw1/ontology#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+# ---- classes ----
+hw1:Batch     a rdfs:Class .
+hw1:Frame     a rdfs:Class .
+hw1:Component a rdfs:Class .
+hw1:RGBImage   rdfs:subClassOf hw1:Component .
+hw1:DepthImage rdfs:subClassOf hw1:Component .
+hw1:QualityFactor a rdfs:Class .
+
+# ---- object properties ----
+hw1:hasFrame     a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range hw1:Frame .
+hw1:hasComponent a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range hw1:Component .
+
+# ---- datatype properties ----
+hw1:batchName          a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string .
+hw1:batchPath          a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string .
+hw1:floor              a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:integer .
+hw1:frameIndex         a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range xsd:integer .
+hw1:avgLuma            a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range xsd:double .
+hw1:validDepthFraction a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range xsd:double .
+hw1:imagePath          a rdf:Property ; rdfs:domain hw1:Component ; rdfs:range xsd:string .
+hw1:minValue           a rdf:Property ; rdfs:range xsd:double .
+hw1:maxValue           a rdf:Property ; rdfs:range xsd:double .
+
+# ---- data-quality qualification factors (floor-1 reference band, from hw1/definitions.md) ----
+hw1:GoodBrightnessRange a hw1:QualityFactor ;
+    rdfs:comment "avg_luma_rec601 band, floor 1 (definitions.md)" ;
+    hw1:minValue 146.35 ; hw1:maxValue 230.87 .
+
+hw1:ValidDepthRatio a hw1:QualityFactor ;
+    rdfs:comment "valid_depth_fraction minimum, floor 1 (definitions.md)" ;
+    hw1:minValue 0.570 .
