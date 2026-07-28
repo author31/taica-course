@@ -1,0 +1,60 @@
+# compare_batches.rq — per-frame observable deltas between two batches.
+#
+# This is the query that answers "why a triplestore instead of a dataframe".
+# Everything valid_frames.rq does, a single `df[df.vdf >= dmin & ...]` also does,
+# and faster. This one does not: it spans TWO named graphs, joining the frames of
+# a clean capture and a degraded capture on frameIndex, and it never has to be
+# told that the two batches share a trajectory — the join discovers it. The store
+# holds every batch you ever inserted under one endpoint; adding a third capture
+# adds no plumbing, only another graph to name.
+#
+# What it is for: the two floor-1 captures follow the SAME trajectory, so frame i
+# of `baseline` and frame i of `mixed` see the same geometry from the same pose,
+# and the only difference is the injected degradation. The per-frame delta is
+# therefore attributable — it isolates the effect from the scene content, which a
+# single-batch histogram cannot do. That is the measurement the analysis needs
+# when arguing which factor actually tracks degradation.
+#
+# ---- substitution-token contract ----
+#
+# Same convention as valid_frames.rq. `api.py compare` runs this template — it
+# loads the file, substitutes the tokens, sends the SELECT to Fuseki and prints
+# the rows, exactly as `retrieve` does for valid_frames.rq. Only the query body
+# below is yours. Tokens:
+#
+#   @@NS@@       the ontology namespace IRI
+#   @@BATCH_A@@  the reference batch name  (the clean capture, e.g. baseline)
+#   @@BATCH_B@@  the compared batch name   (the degraded capture)
+#
+# Two graphs, two batch names, so the tokens are numbered — do not collapse them
+# to one @@BATCH@@.
+#
+# A NOTE ON PROVENANCE (and a trap worth falling into deliberately): the clip
+# fractions of the two batches are only comparable if both were measured at the
+# same tau. tauHi / tauLo are recorded on each Batch node exactly so that this
+# query can check it rather than assume it. Bind both batches' tau and either
+# return them alongside the deltas or FILTER the mismatch out — a clip delta
+# across two taus measures your threshold, not the scene.
+PREFIX hw1: <@@NS@@>
+PREFIX schema: <https://schema.org/>
+SELECT ?idx ?dVdf ?dRough ?dClipHi ?dClipLo WHERE {
+  # #TODO: two GRAPH blocks, one per batch.
+  #
+  #   GRAPH ?ga { ... batchName "@@BATCH_A@@" ... ?idx ... observables ... }
+  #   GRAPH ?gb { ... batchName "@@BATCH_B@@" ... ?idx ... observables ... }
+  #
+  # Reusing the SAME ?idx variable in both blocks IS the join: a frame index
+  # present in only one batch simply drops out. Every other variable must be
+  # distinct between the blocks, or the two graphs will fight over one binding
+  # and you will get an empty result set with no error.
+  #
+  # #TODO: compute the deltas with BIND(... AS ?dVdf) etc., B minus A, so a
+  #        negative delta reads as "degraded relative to the reference" — for the
+  #        three more-is-worse observables that convention inverts, and ?dRough is
+  #        one of them: depth roughness is a noise sigma, so degradation makes the
+  #        B-minus-A delta go UP, not down. Keep the subtraction order uniform and
+  #        read the sign per factor rather than flipping one to look tidy.
+  #
+  # #TODO (provenance): bind ?tauHiA / ?tauHiB (and the lo pair) off the two
+  #        Batch nodes and decide what to do when they disagree.
+} ORDER BY ?idx

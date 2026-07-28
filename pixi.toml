@@ -15,15 +15,36 @@ withbullet = { version = "*", channel = "aihabitat" }
 gdown = "*"
 pygame = "*"
 pyyaml = "*"
+rdflib = "*"
+pytest = "*"
+openjdk = "21.*"    # Fuseki 6.x needs Java >= 21 (class file 65)
 
 [feature.habitat.pypi-dependencies]
 habitat-lab = { path = "dependencies/habitat-lab/habitat-lab", editable = true }
+simulator = { path = "packages/simulator", editable = true }
 opencv-python = "==4.8.0.76"
 open3d = "*"
 
 [feature.habitat.tasks]
 smoke = { cmd = "python -c \"import habitat_sim, habitat; print('habitat-sim', habitat_sim.__version__); print('habitat-lab', habitat.__version__); print('bullet build:', habitat_sim.built_with_bullet)\"" }
 fetch-replica = { cmd = "mkdir -p replica_v1 && gdown https://drive.google.com/uc?id=1zHA2AYRtJOmlRaHNuXOvC_OaVxHe56M4 -O replica_v1/apartment_0.zip && unzip -o replica_v1/apartment_0.zip -d replica_v1 && rm replica_v1/apartment_0.zip" }
+test = { cmd = "pytest hw1/test_e2e.py -v" }   # ontology regression only; simulator suite: pytest packages/simulator/tests/
+
+[feature.fuseki.dependencies]
+openjdk = "21.*"    # Fuseki 6.x needs Java >= 21 (class file 65)
+
+[feature.fuseki.tasks]
+fuseki-fetch = { cmd = """
+  test -f hw1/fuseki_bin/apache-jena-fuseki-6.1.0/fuseki-server.jar || (
+    mkdir -p hw1/fuseki_bin &&
+    curl -fL https://dlcdn.apache.org/jena/binaries/apache-jena-fuseki-6.1.0.tar.gz -o hw1/fuseki_bin/fuseki.tar.gz &&
+    tar -xzf hw1/fuseki_bin/fuseki.tar.gz -C hw1/fuseki_bin &&
+    rm hw1/fuseki_bin/fuseki.tar.gz
+  )
+""" }
+fuseki-serve = { cmd = "java -Xmx2g -jar hw1/fuseki_bin/apache-jena-fuseki-6.1.0/fuseki-server.jar --mem /ds" }
+fuseki = { cmd = "java -Xmx2g -jar hw1/fuseki_bin/apache-jena-fuseki-6.1.0/fuseki-server.jar --mem /ds", depends-on = ["fuseki-fetch"] }
 
 [environments]
 habitat = { features = ["habitat"], solve-group = "habitat" }
+fuseki = { features = ["fuseki"] }

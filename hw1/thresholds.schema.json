@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taica.course/hw1/thresholds.schema.json",
+  "title": "hw1/thresholds.json",
+  "description": "The six numbers you derive, and the only place in the assignment a derived number may live. api.py reads this file at runtime; it is NOT in the repo, you author it. Nothing has a default: a threshold nobody derived is a threshold nobody can defend, so api.py raises rather than filling one in. The file is FLAT -- one band set for the whole assignment, not one per floor, because applying the floor-1 bands to your floor-2 capture and reporting whether they transferred IS the phase-2 deliverable. Two kinds of number live here and they are read at different times: tau_lo/tau_hi are MEASUREMENT parameters, read at insert time and baked into every stored clip fraction (change one and the store is stale -- re-run insert, which replaces the batch's named graph wholesale and is therefore safe to repeat); the four bands are GATING parameters, read at retrieve time (change one and you re-run retrieve, nothing else). NAMING: every band key is <observable_name>_<min|max>, so the key names the exact observable it bounds; the shorter spellings you will see on the retrieve CLI (--valid-depth-min, --roughness-max, --clip-hi-max, --clip-lo-max) are override FLAGS in a separate namespace and are not keys of this file. The Immerkaer kernel and its two constants, behind depth_roughness, are NOT here either: they are fixed by the measurement contract in api.py, not derived by you.",
+  "type": "object",
+  "required": ["tau_lo", "tau_hi", "bands"],
+  "additionalProperties": false,
+  "properties": {
+    "tau_lo": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 255,
+      "description": "Shadow-clipping threshold on V = max(R,G,B). A pixel with V <= tau_lo has EVERY channel crushed. Must be < tau_hi. Read at insert time; recorded on the Batch node as hw1:tauLo, without which a stored clip fraction has no recoverable meaning."
+    },
+    "tau_hi": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 255,
+      "description": "Highlight-clipping threshold on V = max(R,G,B). A pixel with V >= tau_hi has AT LEAST ONE channel saturated. Must be > tau_lo. Read at insert time; recorded on the Batch node as hw1:tauHi."
+    },
+    "bands": {
+      "type": "object",
+      "description": "The four one-sided gates, all read at retrieve time and substituted into the FILTER of queries/valid_frames.rq. A frame passes only if it clears all four. They do NOT all point the same way: valid_depth_fraction_min is the only lower bound, the other three are upper bounds. None is a range. The _min / _max suffix on each key states its direction.",
+      "required": [
+        "valid_depth_fraction_min",
+        "depth_roughness_max",
+        "clip_hi_fraction_max",
+        "clip_lo_fraction_max"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "valid_depth_fraction_min": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Keep frames with valid_depth_fraction >= this. More usable depth is better."
+        },
+        "depth_roughness_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Keep frames with depth_roughness <= this, in METRES. The observable is a reference-free estimate of the depth raster's noise standard deviation (Immerkaer 1996), so LOWER is better -- note the direction, this bound points the opposite way to valid_depth_fraction_min. A frame with no measurable window at all scores inf and is therefore rejected by any finite bound here. The maximum of 10 is only a sanity ceiling: a noise level above the sensor's whole usable range is a unit error, millimetres written where metres belong."
+        },
+        "clip_hi_fraction_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Keep frames with clip_hi_fraction <= this. Less blown-out is better. Meaningful only alongside the tau_hi it was measured at."
+        },
+        "clip_lo_fraction_max": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Keep frames with clip_lo_fraction <= this. Less crushed is better. Meaningful only alongside the tau_lo it was measured at."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "tau_lo": 20,
+      "tau_hi": 240,
+      "bands": {
+        "valid_depth_fraction_min": 0.50,
+        "depth_roughness_max": 0.02,
+        "clip_hi_fraction_max": 0.10,
+        "clip_lo_fraction_max": 0.10
+      }
+    }
+  ]
+}

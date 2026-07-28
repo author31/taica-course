@@ -1,0 +1,134 @@
+# Ontology Metadata
+
+@prefix hw1:     <http://taica.course/hw1/ontology#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix schema:  <https://schema.org/> .
+@prefix dqv:     <http://www.w3.org/ns/dqv#> .
+@prefix qudt:    <http://qudt.org/schema/qudt/> .
+@prefix unit:    <http://qudt.org/vocab/unit/> .
+@prefix skos:    <http://www.w3.org/2004/02/skos/core#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix vann:    <http://purl.org/vocab/vann/> .
+
+<http://taica.course/hw1/ontology> a owl:Ontology ;
+    dcterms:title "HW1 RGB-D capture quality ontology"@en ;
+    owl:versionIRI <http://taica.course/hw1/ontology/1.0.0> ;
+    vann:preferredNamespacePrefix "hw1" ;
+    vann:preferredNamespaceUri "http://taica.course/hw1/ontology#" .
+
+#   Batch  --hw1:hasFrame-->  Frame  --hw1:hasRGBImage-->    RGBImage
+#                                    --hw1:hasDepthImage-->  DepthImage
+
+# Core Classes
+
+hw1:Batch     a rdfs:Class .
+hw1:Frame     a rdfs:Class .
+hw1:RGBImage   rdfs:subClassOf schema:ImageObject .
+hw1:DepthImage rdfs:subClassOf schema:ImageObject .
+hw1:QualityFactor a rdfs:Class .
+
+# ---- data-quality qualification factors ----
+# Bands intentionally have no pre-defined min/max here; supply them at query time.
+
+hw1:QualityFactor rdfs:subClassOf dqv:Metric .
+
+# Polarity is a term, not prose in a comment, so queries can read it.
+hw1:Polarity       a rdfs:Class ; rdfs:subClassOf skos:Concept .
+hw1:HigherIsBetter a hw1:Polarity ; rdfs:label "higher is better"@en .
+hw1:LowerIsBetter  a hw1:Polarity ; rdfs:label "lower is better"@en .
+
+# Links from a factor to the property it grades, the class it grades it on,
+# and any batch-level threshold its value depends on.
+hw1:overProperty a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdf:Property ;
+    rdfs:comment "The observable datatype property this factor grades."@en .
+hw1:polarity a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range hw1:Polarity .
+hw1:appliesTo a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdfs:Class .
+hw1:parameterisedBy a rdf:Property ;
+    rdfs:domain hw1:QualityFactor ; rdfs:range rdf:Property ;
+    rdfs:comment "Batch-level threshold property this factor's value depends on."@en .
+
+hw1:ValidDepthRatio a hw1:QualityFactor ;
+    rdfs:label "valid depth ratio"@en ;
+    hw1:overProperty hw1:validDepthFraction ;
+    hw1:polarity     hw1:HigherIsBetter ;
+    hw1:appliesTo    hw1:DepthImage ;
+    dqv:expectedDataType xsd:double .
+
+hw1:DepthRoughness a hw1:QualityFactor ;
+    rdfs:label "depth roughness"@en ;
+    hw1:overProperty hw1:depthRoughness ;
+    hw1:polarity     hw1:LowerIsBetter ;
+    hw1:appliesTo    hw1:DepthImage ;
+    dqv:expectedDataType xsd:double ;
+    qudt:unit        unit:M .
+
+hw1:HighlightClipping a hw1:QualityFactor ;
+    rdfs:label "highlight clipping"@en ;
+    hw1:overProperty hw1:clipHiFraction ;
+    hw1:polarity     hw1:LowerIsBetter ;
+    hw1:appliesTo    hw1:RGBImage ;
+    hw1:parameterisedBy hw1:tauHi ;
+    dqv:expectedDataType xsd:double .
+
+hw1:ShadowClipping a hw1:QualityFactor ;
+    rdfs:label "shadow clipping"@en ;
+    hw1:overProperty hw1:clipLoFraction ;
+    hw1:polarity     hw1:LowerIsBetter ;
+    hw1:appliesTo    hw1:RGBImage ;
+    hw1:parameterisedBy hw1:tauLo ;
+    dqv:expectedDataType xsd:double .
+
+# ---- band vocabulary ----
+# Terms only. Band individuals are supplied at query time, in a separate graph.
+
+hw1:Band a rdfs:Class ;
+    rdfs:comment "A [min,max] interval over one factor, carrying a grade."@en .
+hw1:forFactor    a rdf:Property ; rdfs:domain hw1:Band ; rdfs:range hw1:QualityFactor .
+hw1:grade        a rdf:Property ; rdfs:domain hw1:Band ; rdfs:range skos:Concept .
+hw1:minInclusive a rdf:Property ; rdfs:domain hw1:Band ; rdfs:range xsd:double .
+hw1:maxInclusive a rdf:Property ; rdfs:domain hw1:Band ; rdfs:range xsd:double .
+
+hw1:Good a skos:Concept ; skos:prefLabel "good"@en .
+
+# Properties
+
+# ---- object properties ----
+hw1:hasFrame      a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range hw1:Frame .
+hw1:hasRGBImage   a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range hw1:RGBImage .
+hw1:hasDepthImage a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range hw1:DepthImage .
+
+# ---- datatype properties: identity and structure ----
+hw1:batchName          a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string .
+hw1:batchPath          a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:string .
+hw1:floor              a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:integer .
+hw1:frameIndex         a rdf:Property ; rdfs:domain hw1:Frame ; rdfs:range xsd:integer .
+hw1:tauHi              a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:double ;
+    rdfs:comment "Highlight-clipping threshold tau_hi this batch was measured at (0-255). Student-derived." .
+hw1:tauLo              a rdf:Property ; rdfs:domain hw1:Batch ; rdfs:range xsd:double ;
+    rdfs:comment "Shadow-clipping threshold tau_lo this batch was measured at (0-255). Student-derived." .
+
+# ---- datatype properties: per-frame observables ----
+# Depth side.
+hw1:validDepthFraction a rdf:Property ; rdfs:domain hw1:DepthImage ; rdfs:range xsd:double ;
+    rdfs:label "valid depth fraction" ;
+    rdfs:comment "Fraction in [0,1] of depth pixels that are non-zero and inside the configured range." .
+hw1:depthRoughness     a rdf:Property ; rdfs:domain hw1:DepthImage ; rdfs:range xsd:double ;
+    rdfs:label "depth roughness" ;
+    rdfs:comment "Reference-free single-frame depth-noise estimate (Immerkaer), in metres, as an estimated standard deviation; LOWER IS BETTER, one-sided <= band." .
+
+# RGB side. Both clip fractions are counted against the batch's tauHi / tauLo.
+hw1:clipHiFraction     a rdf:Property ; rdfs:domain hw1:RGBImage ; rdfs:range xsd:double ;
+    rdfs:label "highlight clip fraction" ;
+    rdfs:comment "Fraction in [0,1] of pixels with max(R,G,B) >= tauHi (at least one channel saturated)." .
+hw1:clipLoFraction     a rdf:Property ; rdfs:domain hw1:RGBImage ; rdfs:range xsd:double ;
+    rdfs:label "shadow clip fraction" ;
+    rdfs:comment "Fraction in [0,1] of pixels with max(R,G,B) <= tauLo (every channel crushed)." .
+hw1:meanValue          a rdf:Property ; rdfs:domain hw1:RGBImage ; rdfs:range xsd:double ;
+    rdfs:label "mean value" ;
+    rdfs:comment "mean(max(R,G,B)) over the frame, in [0,255]. Baseline only, deliberately weak." .
