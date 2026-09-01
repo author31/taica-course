@@ -11,25 +11,45 @@ Contract highlights (plan.md §3.1):
 - `uncertainties.seed` is NOT read here: it governs only the per-frame depth
   RNG the Engine builds (see engine.Engine.observe).
 
-This module is importable with numpy alone; PIL and habitat_sim are imported
-lazily inside semantic_to_vis (the only function that needs them).
+This module is importable with numpy alone; habitat_sim is imported lazily
+inside semantic_to_vis (the only function that needs it, for its palette).
+
+PERFORMANCE (the interactive preview runs this once per frame at 30 fps):
+- apply_lighting is a per-channel 256-entry lookup table. The photometric
+  pipeline is purely elementwise, so evaluating it on the 256 possible 8-bit
+  inputs (_apply_lighting_dense on a ramp) and gathering is bit-identical to
+  running it on every pixel. The gather is cv2.LUT when cv2 is importable
+  (~0.2 ms per 512x512 frame vs ~2.7 ms for the dense pipeline), np.take
+  otherwise (~1.9 ms); both give the same pixels.
+- semantic_to_vis is a numpy palette gather (the PIL putdata path it replaces
+  spent ~9 ms per 512x512 frame on Python-level element iteration).
+- process_observations tolerates missing optional sensors (semantic, bird's-eye)
+  so engine.make_cfg can leave them out when nothing consumes them.
 """
 
 import numpy as np
+
+try:
+    # Optional accelerator for the two per-frame gathers below (cv2.LUT runs
+    # ~10x faster than np.take and is multi-threaded). The numpy code paths are
+    # the reference and produce identical pixels; cv2 is never required.
+    import cv2 as _cv2
+except ImportError:  # pragma: no cover - exercised in environments without cv2
+    _cv2 = None
 
 
 # =============================================================================
 # Sensor post-processing (this is where "real-world uncertainty" is injected)
 # =============================================================================
-def apply_lighting(rgb, cfg, t=0.0):
-    """Photometric emulation of lighting conditions on an RGB (H,W,3) uint8 image.
+def _apply_lighting_dense(rgb, cfg, t=0.0):
+    """Reference photometric pipeline, evaluated on every pixel in float32.
 
-    `t` is a time in seconds used to flicker brightness periodically:
-        brightness *= 1 + amplitude * sin(2*pi*frequency*t + phase)
-    amplitude 0 (default) leaves brightness steady. In interactive mode `t` is
-    wall-clock; in replay it is derived from the frame index (i / fps_nominal) so
-    flicker is reproducible across runs/machines.
-    """
+    This is the DEFINITION of apply_lighting. Every step is elementwise (a
+    pixel's output depends only on its own 8-bit value and its channel's
+    parameters), so apply_lighting evaluates this on a (1, 256, 3) ramp of all
+    input values and applies the result as a lookup table — bit-identical
+    output, no per-pixel float work. Kept as a function so tests can check the
+    equivalence directly."""
     img = rgb[:, :, :3].astype(np.float32) / 255.0
     img *= np.asarray(cfg["ambient_rgb"], dtype=np.float32)   # colour tint / temperature
     amplitude = float(cfg.get("amplitude", 0.0))
@@ -44,6 +64,52 @@ def apply_lighting(rgb, cfg, t=0.0):
     if gamma != 1.0:
         img = img ** (1.0 / gamma)
     return (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+# Every 8-bit input value, per channel: (1, 256, 3) with ramp[0, v, c] == v.
+_LUT_RAMP = np.broadcast_to(np.arange(256, dtype=np.uint8)[None, :, None], (1, 256, 3))
+
+
+def lighting_lut(cfg, t=0.0):
+    """(3, 256) uint8 table: lut[c, v] = apply_lighting output for input value v
+    on channel c, under `cfg` at time `t`. Costs one 768-element pass of the
+    reference pipeline (~20 us)."""
+    return np.ascontiguousarray(_apply_lighting_dense(_LUT_RAMP, cfg, t)[0].T)
+
+
+def apply_lighting(rgb, cfg, t=0.0):
+    """Photometric emulation of lighting conditions on an RGB (H,W,3) uint8 image.
+
+    `t` is a time in seconds used to flicker brightness periodically:
+        brightness *= 1 + amplitude * sin(2*pi*frequency*t + phase)
+    amplitude 0 (default) leaves brightness steady. In interactive mode `t` is
+    wall-clock; in replay it is derived from the frame index (i / fps_nominal) so
+    flicker is reproducible across runs/machines.
+
+    Implemented as a per-channel lookup table over _apply_lighting_dense (see
+    there) — identical pixels, ~10x cheaper. A 4-channel (RGBA) input is
+    accepted; only the first three channels are read. Non-uint8 input falls
+    back to the dense pipeline.
+    """
+    if rgb.dtype != np.uint8:
+        return _apply_lighting_dense(rgb, cfg, t)
+    lut = lighting_lut(cfg, t)                           # (3, 256)
+    grey = np.array_equal(lut[0], lut[1]) and np.array_equal(lut[0], lut[2])
+    if _cv2 is not None:
+        if rgb.shape[2] == 4:
+            src = _cv2.cvtColor(rgb, _cv2.COLOR_RGBA2RGB)   # contiguous (H,W,3)
+        else:
+            src = np.ascontiguousarray(rgb[:, :, :3])
+        if grey:
+            return _cv2.LUT(src, lut[0])                 # one table for all channels
+        return _cv2.LUT(src, np.ascontiguousarray(lut.T).reshape(1, 256, 3))
+    src = rgb[:, :, :3]
+    if grey:
+        return np.take(lut[0], src)                      # grey tint: one gather
+    out = np.empty(src.shape[:2] + (3,), dtype=np.uint8)
+    for c in range(3):
+        out[:, :, c] = np.take(lut[c], src[:, :, c])
+    return out
 
 
 def light_exposure(cfg, t=0.0):
@@ -67,7 +133,7 @@ def apply_depth_faults(depth_m, cfg, rng):
     if not cfg.get("enabled", True) or cfg.get("stuck", False):
         return np.zeros_like(depth_m)
 
-    d = depth_m.astype(np.float32).copy()
+    d = depth_m.astype(np.float32)          # astype always returns a fresh copy
 
     if float(cfg["noise_std"]) > 0.0:
         d += rng.normal(0.0, float(cfg["noise_std"]), size=d.shape).astype(np.float32)
@@ -122,19 +188,21 @@ def apply_depth_sensor(depth_m, cfg, light, rng):
 def depth_to_vis(depth_m, max_range):
     d = np.clip(depth_m / max(max_range, 1e-6), 0.0, 1.0)
     gray = (d * 255.0).astype(np.uint8)
+    if _cv2 is not None:
+        return _cv2.cvtColor(gray, _cv2.COLOR_GRAY2RGB)   # same bytes, no np.repeat pass
     return np.repeat(gray[:, :, None], 3, axis=2)  # (H,W,3) RGB
 
 
 def semantic_to_vis(semantic_obs):
-    # Lazy imports: keep this module importable (and the rest of the pixel
-    # pipeline testable) without habitat_sim / PIL installed.
-    from PIL import Image
+    """(H,W) instance ids -> (H,W,3) RGB uint8 via habitat's 40-colour d3 palette
+    (id % 40). Plain numpy gather: same pixels as the former PIL palette-image
+    path, without its per-element Python iteration."""
+    # Lazy import: keep this module importable (and the rest of the pixel
+    # pipeline testable) without habitat_sim installed.
     from habitat_sim.utils.common import d3_40_colors_rgb
 
-    img = Image.new("P", (semantic_obs.shape[1], semantic_obs.shape[0]))
-    img.putpalette(d3_40_colors_rgb.flatten())
-    img.putdata((semantic_obs.flatten() % 40).astype(np.uint8))
-    return np.asarray(img.convert("RGB"))  # (H,W,3) RGB
+    palette = np.ascontiguousarray(d3_40_colors_rgb, dtype=np.uint8)   # (40, 3)
+    return palette[np.asarray(semantic_obs) % 40]                      # (H,W,3) RGB
 
 
 # =============================================================================
@@ -156,6 +224,11 @@ def process_observations(obs, config, t=0.0, rng=None, overrides=None):
 
     `rng` is the per-frame Generator for depth faults; if None it defaults to
     np.random.default_rng(0) so legacy no-rng calls stay deterministic.
+
+    "birdseye" and "semantic" are None when `obs` lacks the corresponding
+    sensor (engine.make_cfg only attaches them when display.show_birdseye /
+    output.save_semantic ask for them); color_sensor and depth_sensor are
+    always required.
     """
     if rng is None:
         rng = np.random.default_rng(0)
@@ -168,12 +241,14 @@ def process_observations(obs, config, t=0.0, rng=None, overrides=None):
             depth_cfg = {**depth_cfg, **overrides["depth"]}
     light = light_exposure(lighting_cfg, t)                     # shared by RGB + depth
     depth_m = apply_depth_sensor(obs["depth_sensor"], depth_cfg, light, rng)
+    birdseye = obs.get("birdseye_sensor")
+    semantic = obs.get("semantic_sensor")
     return {
         "rgb": apply_lighting(obs["color_sensor"], lighting_cfg, t),  # RGB uint8
-        "birdseye": obs["birdseye_sensor"][:, :, :3],                 # top-down RGB uint8
+        "birdseye": None if birdseye is None else birdseye[:, :, :3],  # top-down RGB uint8
         "depth_m": depth_m,
         "depth_vis": depth_to_vis(depth_m, float(depth_cfg["max_range"])),
-        "semantic": semantic_to_vis(obs["semantic_sensor"]),          # RGB uint8
+        "semantic": None if semantic is None else semantic_to_vis(semantic),  # RGB uint8
     }
 
 

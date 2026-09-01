@@ -33,6 +33,19 @@ OUTPUTS (under output.root)
     parameters, written by simulator.prepare_capture_dirs. Reconstruction reads
     them from the capture it is reconstructing, never from a config.
 
+PERFORMANCE (what makes the preview keep 30 fps on a modest machine)
+    Per frame the loop renders the sensors habitat needs, applies the pixel
+    pipeline and repaints the window. The expensive parts are engineered out:
+    the raw readout is cached while the agent stands still (Engine), only the
+    sensors something consumes are attached (semantic only if
+    output.save_semantic, bird's-eye only if display.show_birdseye), lighting
+    is a lookup table, and the viewer repaints only panels whose pixels changed
+    (viewer.Preview). The overlay shows the achieved fps. Knobs if it still
+    stutters: `display.show_birdseye: false` (one fewer 512x512 render per
+    frame), `display.scale: 0.5` (quarter the window pixels — matters most
+    over a remote desktop such as NX/VNC, which re-encodes every changed pixel),
+    `--fps 20`.
+
 GL ORDERING — DO NOT REORDER (condensed; details in simulator.engine / viewer)
     habitat-sim and pygame both want a GL context on the same X display and
     crash with `X_GLXMakeCurrent BadAccess` if they share it. Engine hides
@@ -68,8 +81,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_replay(engine, viewer, screen, font, traj_path, fps, data_root, out_cfg,
-               display_cfg):
+def run_replay(engine, viewer, preview, traj_path, fps, data_root, out_cfg):
     """Replay a .npy pose trajectory, previewing AND saving every frame.
 
     Deterministic time base (t = i / engine.fps_nominal) lives inside
@@ -83,12 +95,14 @@ def run_replay(engine, viewer, screen, font, traj_path, fps, data_root, out_cfg,
 
     def on_frame(frame, sensor_state, idx):
         save_frame(frame, sensor_state, data_root, out_cfg, idx)
-        viewer.draw(screen, frame, display_cfg, idx, font)
+        preview.draw(frame, idx)
         for event in pygame.event.get():          # let the user abort mid-replay
             if event.type == pygame.QUIT or (
                     event.type == pygame.KEYDOWN
                     and event.key in (pygame.K_q, pygame.K_ESCAPE)):
                 return False
+            if event.type in viewer.EXPOSE_EVENTS:
+                preview.invalidate()
         if delay_ms:
             pygame.time.wait(delay_ms)
         return True
@@ -99,8 +113,7 @@ def run_replay(engine, viewer, screen, font, traj_path, fps, data_root, out_cfg,
           f"{os.path.join(data_root, 'GT_pose.npy')}")
 
 
-def run_interactive(engine, viewer, screen, font, fps, data_root, out_cfg,
-                    display_cfg):
+def run_interactive(engine, viewer, preview, fps, data_root, out_cfg):
     """Keyboard-driven collection; zones fire wherever the agent walks."""
     from simulator import save_frame
 
@@ -128,9 +141,10 @@ def run_interactive(engine, viewer, screen, font, fps, data_root, out_cfg,
     t0 = time.monotonic()   # session start: flicker phase runs on wall-clock delta
 
     def observe_now():
-        """Re-render the CURRENT sensors at the CURRENT wall-clock t, so the
+        """Re-process the CURRENT sensors at the CURRENT wall-clock t, so the
         flicker oscillation keeps advancing even while the agent is standing
-        still (the ZONE it stands in only changes when the agent moves)."""
+        still (the ZONE it stands in only changes when the agent moves). The
+        raw readout itself is cached by the Engine until the agent moves."""
         frame = engine.observe(time.monotonic() - t0)
         sensor_state = engine.agent.get_state().sensor_states["color_sensor"]
         return frame, sensor_state
@@ -154,8 +168,10 @@ def run_interactive(engine, viewer, screen, font, fps, data_root, out_cfg,
                 elif event.key in KEY_ACTION:
                     engine.step(KEY_ACTION[event.key])
                 # any other key is ignored
+            elif event.type in viewer.EXPOSE_EVENTS:
+                preview.invalidate()       # window (re)exposed: full repaint
         frame, sensor_state = observe_now()   # continuous time-driven render
-        viewer.draw(screen, frame, display_cfg, count, font)
+        preview.draw(frame, count, fps=clock.get_fps())
         clock.tick(fps)
 
     np.save(os.path.join(data_root, "GT_pose.npy"),
@@ -230,14 +246,14 @@ def main():
     screen = pygame.display.set_mode(
         (int(canvas.shape[1] * scale), int(canvas.shape[0] * scale)))
     pygame.display.set_caption("Habitat data collector")
+    preview = viewer.Preview(screen, display_cfg, font)   # incremental repaints
 
     try:
         if args.trajectory:
-            run_replay(engine, viewer, screen, font, args.trajectory, args.fps,
-                       data_root, out_cfg, display_cfg)
+            run_replay(engine, viewer, preview, args.trajectory, args.fps,
+                       data_root, out_cfg)
         else:
-            run_interactive(engine, viewer, screen, font, fps, data_root,
-                            out_cfg, display_cfg)
+            run_interactive(engine, viewer, preview, fps, data_root, out_cfg)
         report_zone_coverage(config, scheduler, data_root)
     finally:
         pygame.quit()

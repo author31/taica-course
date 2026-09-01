@@ -352,3 +352,72 @@ def test_no_global_np_random_in_module():
     for banned in ("np.random.normal", "np.random.random", "np.random.seed",
                    "np.random.uniform", "np.random.choice"):
         assert banned not in src, f"global RNG call {banned} must not appear in effects.py"
+
+
+# --- performance paths must not change pixels --------------------------------
+def test_apply_lighting_lut_matches_dense_pipeline():
+    """apply_lighting is a 256-entry LUT over _apply_lighting_dense; it must be
+    bit-identical to running the dense pipeline on every pixel, for tinted,
+    flickering, gamma'd and neutral configs alike, RGBA input included."""
+    rng = np.random.default_rng(0)
+    rgba = rng.integers(0, 256, size=(37, 41, 4), dtype=np.uint8)   # habitat colour is RGBA
+    rgba[0, :4, :3] = [[0, 0, 0], [255, 255, 255], [1, 254, 128], [127, 128, 129]]
+    cfgs = [
+        dict(brightness=1.0, contrast=1.0, gamma=1.0, ambient_rgb=[1.0, 1.0, 1.0]),
+        dict(brightness=1.3, contrast=1.2, gamma=2.2, ambient_rgb=[1.0, 0.9, 0.7],
+             amplitude=0.6, frequency=1.17, phase=0.0),
+        dict(brightness=0.4, contrast=0.8, gamma=0.7, ambient_rgb=[0.8, 1.0, 1.1]),
+        dict(brightness=1.95, contrast=1.0, gamma=1.0, ambient_rgb=[1.0, 1.0, 1.0],
+             amplitude=0.95, frequency=1.91, phase=0.0),
+    ]
+    for cfg in cfgs:
+        for t in (0.0, 0.37, 12.5):
+            fast = effects.apply_lighting(rgba, cfg, t)
+            ref = effects._apply_lighting_dense(rgba, cfg, t)
+            assert fast.shape == (37, 41, 3) and fast.dtype == np.uint8
+            np.testing.assert_array_equal(fast, ref)
+    # 3-channel input works too (the unit tests' fixed_rgb layout)
+    np.testing.assert_array_equal(
+        effects.apply_lighting(fixed_rgb(), cfgs[1], 0.5),
+        effects._apply_lighting_dense(fixed_rgb(), cfgs[1], 0.5))
+
+
+def test_process_observations_tolerates_missing_optional_sensors():
+    """engine.make_cfg leaves semantic / bird's-eye sensors out when nothing
+    consumes them; the frame then carries None for those keys and everything
+    else is unaffected."""
+    config = {"lighting": dict(brightness=1.0, contrast=1.0, gamma=1.0,
+                               ambient_rgb=[1.0, 1.0, 1.0]),
+              "depth": DEPTH_CFG}
+    rgba = np.zeros((6, 8, 4), dtype=np.uint8)
+    obs = {"color_sensor": rgba, "depth_sensor": fixed_depth()}
+    frame = effects.process_observations(obs, config, 0.0, np.random.default_rng(1))
+    assert frame["birdseye"] is None and frame["semantic"] is None
+    assert frame["rgb"].shape == (6, 8, 3)
+    assert frame["depth_m"].shape == (6, 8) and frame["depth_vis"].shape == (6, 8, 3)
+    full = effects.process_observations(
+        {**obs, "birdseye_sensor": rgba}, config, 0.0, np.random.default_rng(1))
+    assert full["birdseye"].shape == (6, 8, 3)
+    np.testing.assert_array_equal(full["depth_m"], frame["depth_m"])
+
+
+def test_lighting_and_depth_vis_numpy_fallback_matches_cv2(monkeypatch):
+    """With cv2 unavailable the numpy gathers must give the same pixels as the
+    cv2 paths (and both the same as the dense reference)."""
+    if effects._cv2 is None:
+        pytest.skip("cv2 not importable here; only the numpy path exists")
+    rng = np.random.default_rng(3)
+    rgba = rng.integers(0, 256, size=(23, 29, 4), dtype=np.uint8)
+    depth = rng.random((23, 29), dtype=np.float32) * 12.0
+    cfg = dict(brightness=1.1, contrast=1.2, gamma=1.8, ambient_rgb=[1.0, 0.9, 0.8],
+               amplitude=0.3, frequency=0.73, phase=0.0)
+    grey = dict(brightness=0.7, contrast=1.0, gamma=1.0, ambient_rgb=[1.0, 1.0, 1.0])
+    with_cv2 = [effects.apply_lighting(rgba, cfg, 0.2), effects.apply_lighting(rgba, grey, 0.2),
+                effects.depth_to_vis(depth, 10.0)]
+    monkeypatch.setattr(effects, "_cv2", None)
+    without = [effects.apply_lighting(rgba, cfg, 0.2), effects.apply_lighting(rgba, grey, 0.2),
+               effects.depth_to_vis(depth, 10.0)]
+    for a, b in zip(with_cv2, without):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(without[0], effects._apply_lighting_dense(rgba, cfg, 0.2))
+    np.testing.assert_array_equal(without[1], effects._apply_lighting_dense(rgba, grey, 0.2))
