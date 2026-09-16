@@ -6,8 +6,8 @@ verdict of every number next to the number, in the student's own file.
 WHAT THIS FILE IS
     A four-subcommand command-line tool that bridges a directory of captured
     SLAM frames to local RDF Turtle files, using `rdflib` and nothing else for
-    the RDF. No server, no daemon, and — since §10 — no SPARQL:
-    every artefact is a self-contained .ttl file on disk.
+    the RDF. There is no server or daemon: every artefact is a self-contained
+    .ttl file on disk, and local SPARQL queries run directly against it.
 
     * `declare`    — scaffold a declaration Turtle under `hw1/experiments/`:
                      prefixes, the Experiment node whose IRI tail equals the file
@@ -32,6 +32,8 @@ WHAT THIS FILE IS
                      runs and the computed VERDICT section) or several
                      experiments side by side. Writes nothing, measures nothing
                      (§7.1).
+    * `query`      — run a student-supplied read-only SPARQL query against one
+                     local Turtle file. It never needs a triplestore.
     * `batch2ttl`  — DEPRECATED as a required step. `declare` / `experiment` /
                      `explore` face the capture directory directly. This command
                      remains only to write optional generation provenance
@@ -42,10 +44,8 @@ WHAT THIS FILE IS
     hw1:ReconstructionRun nodes below the marker of an experiment file through
     `write_run`.
 
-    v2's `query` command, the `queries/*.rq` files and the pyoxigraph dependency
-    are DELETED (§10). With statuses, settings, roles and runs baked
-    into one self-contained file every shipped query degenerated into a
-    projection over that file, and projections are `explore`'s job.
+    `explore` is the guided projection of the experiment. `query` complements it
+    when students want to ask and inspect their own SPARQL questions.
 
 SIX DEPTH FACTORS + TWO RGB FACTORS + ONE BASELINE
     Depth frame: HighFrequencyDepthResidual, FlyingPixelRatio,
@@ -207,8 +207,10 @@ STUDENT IMPLEMENTATION SURFACE (instruction.md §5.2)
 """
 
 import argparse
+import csv
 import glob
 import hashlib
+import json
 import os
 import re
 import sys
@@ -233,6 +235,9 @@ from rdflib import Graph, Literal, Namespace, RDF, RDFS, URIRef, XSD
 #   properties and a run outcome is an ordinary observable.
 # =============================================================================
 NS = "http://taica.course/hw1/ontology#"
+# Instance data uses a separate namespace from the ontology vocabulary. This
+# keeps v5 Turtle qnames legal and readable; legacy v4 IRIs remain under NS.
+DATA_NS = "http://taica.course/hw1/data/"
 HW1 = Namespace(NS)
 SCHEMA = Namespace("https://schema.org/")
 QUDT = Namespace("http://qudt.org/schema/qudt/")
@@ -1037,6 +1042,34 @@ def setting_iri(expname, factor_local, param_local):
     return URIRef(f"{NS}experiment/{expname}/setting/{factor_local}/{param_local}")
 
 
+def data_batch_iri(name):
+    return URIRef(f"{DATA_NS}batch/{name}")
+
+
+def data_frame_iri(name, idx):
+    return URIRef(f"{DATA_NS}batch/{name}/frame/{int(idx)}")
+
+
+def data_component_iri(name, idx, kind):
+    if kind not in ("rgb", "depth"):
+        raise ValueError(f"unknown image kind {kind!r}")
+    return URIRef(f"{DATA_NS}batch/{name}/{kind}/{int(idx)}")
+
+
+def data_experiment_iri(expname):
+    return URIRef(f"{DATA_NS}experiment/{expname}")
+
+
+def data_setting_iri(expname, factor_local, param_local):
+    return URIRef(f"{DATA_NS}experiment/{expname}/setting/{factor_local}_{param_local}")
+
+
+def data_factor_iri(expname, factor_local, current_idx, previous_idx=None):
+    local = (f"{factor_local}_{int(previous_idx)}_{int(current_idx)}"
+             if previous_idx is not None else f"{factor_local}_{int(current_idx)}")
+    return URIRef(f"{DATA_NS}experiment/{expname}/factor/{local}")
+
+
 def annotation_iri(expname, idx, kind):
     """IRI of one experiment's annotation of one frame's ONE MODALITY:
     <ns>experiment/<expname>/annotation/<n>/<kind>, `kind` in "rgb" | "depth".
@@ -1102,6 +1135,20 @@ def run_iri(expname, mode):
     return URIRef(f"{NS}experiment/{expname}/run/{mode}")
 
 
+def factor_iri(expname, factor_local, current_idx, previous_idx=None):
+    """Readable, experiment-scoped IRI for one Factor occurrence.
+
+    The definition is part of the key (not merely a label): two selected
+    definitions over the same image are distinct occurrences.  Pair keys retain
+    the ordered source/target stems.  Keeping this helper beside the other IRI
+    constructors prevents consumers from inferring occurrence identity from
+    predicates or mask paths.
+    """
+    local = f"{factor_local}_{int(previous_idx)}_{int(current_idx)}" if previous_idx is not None \
+        else f"{factor_local}_{int(current_idx)}"
+    return URIRef(f"{NS}experiment/{expname}/factor/{local}")
+
+
 def frame_index_from_iri(iri):
     """Frame OR annotation IRI -> its integer stem. THE tail parse; there is no second.
 
@@ -1127,10 +1174,11 @@ def frame_index_from_iri(iri):
     """
     text = str(iri)
     expected = (f"{NS}batch/<name>/frame/<n> or "
+                f"{DATA_NS}batch/<name>/frame/<n> or "
                 f"{NS}experiment/<expname>/annotation/<n>/<kind>")
-    if text.startswith(f"{NS}batch/") and "/frame/" in text:
+    if (text.startswith(f"{NS}batch/") or text.startswith(f"{DATA_NS}batch/")) and "/frame/" in text:
         tail = text.split("/frame/", 1)[1]
-    elif text.startswith(f"{NS}experiment/") and "/annotation/" in text:
+    elif (text.startswith(f"{NS}experiment/") or text.startswith(f"{DATA_NS}experiment/")) and "/annotation/" in text:
         tail, _, kind = text.split("/annotation/", 1)[1].partition("/")
         if kind not in _ANNOTATION_KINDS:
             raise ValueError(
@@ -1157,22 +1205,26 @@ def batch_name_from_frame_iri(iri):
     """
     text = str(iri)
     prefix = f"{NS}batch/"
+    data_prefix = f"{DATA_NS}batch/"
     marker = "/frame/"
-    if not text.startswith(prefix) or marker not in text:
+    if not ((text.startswith(prefix) or text.startswith(data_prefix)) and marker in text):
         raise ValueError(
             f"not a frame IRI of this assignment: {text!r} "
             f"(expected {NS}batch/<name>/frame/<n>)")
-    return text[len(prefix):].split(marker, 1)[0]
+    base = prefix if text.startswith(prefix) else data_prefix
+    return text[len(base):].split(marker, 1)[0]
 
 
 def _batch_name_from_batch_iri(iri):
     """Batch IRI -> its <name>. Private: batch IRIs are not parsed outside this file."""
     text = str(iri)
     prefix = f"{NS}batch/"
-    if not text.startswith(prefix):
+    data_prefix = f"{DATA_NS}batch/"
+    if not (text.startswith(prefix) or text.startswith(data_prefix)):
         raise ValueError(f"not a batch IRI of this assignment: {text!r} "
                          f"(expected {NS}batch/<name>)")
-    return text[len(prefix):]
+    base = prefix if text.startswith(prefix) else data_prefix
+    return text[len(base):]
 
 
 def _experiment_name_from_iri(iri, path=None):
@@ -1187,11 +1239,13 @@ def _experiment_name_from_iri(iri, path=None):
     """
     text = str(iri)
     prefix = f"{NS}experiment/"
+    data_prefix = f"{DATA_NS}experiment/"
     where = f"{path}: " if path else ""
-    if not text.startswith(prefix):
+    if not (text.startswith(prefix) or text.startswith(data_prefix)):
         raise ValueError(f"{where}not an experiment IRI of this assignment: {text!r} "
                          f"(expected {NS}experiment/<expname>)")
-    name = text[len(prefix):]
+    base = prefix if text.startswith(prefix) else data_prefix
+    name = text[len(base):]
     if not _EXPNAME_RE.match(name):
         raise ValueError(
             f"{where}experiment IRI tail {name!r} is not a legal experiment name "
@@ -1545,6 +1599,26 @@ def load_quality_factors(path=_ONTOLOGY_TTL):
         status = g.value(f, HW1.statusProperty)
         pol = g.value(f, HW1.polarity)
         qual = g.value(f, HW1.qualifiedBy)
+        # Semantic schema uses generic hw1:value/hw1:status on occurrences.
+        # Keep the internal observable key for measurement dispatch and grading;
+        # it is no longer serialized as a per-metric RDF predicate.
+        semantic = over is None and status is None and local in (
+            set(_FRAME_OBSERVABLES) | set(_PAIR_OBSERVABLES) |
+            {"HighlightClipping", "ShadowClipping", "HighFrequencyDepthResidual",
+             "FlyingPixelRatio", "ValidTileCoverage", "IdentityMedianDepthChange",
+             "JointValidDepthRatio", "PriorWarpDepthResidual"})
+        # Run-level definitions may also adopt generic result predicates.  They
+        # are retained for write_run compatibility, so use their own local name
+        # as the internal observable key when the new TBox omits legacy links.
+        if over is None and status is None and _semantic_schema_enabled(path):
+            semantic = True
+        if semantic:
+            aliases = {"HighlightClipping": "clipHiFraction", "ShadowClipping": "clipLoFraction",
+                       "HighFrequencyDepthResidual": "highFrequencyDepthResidual", "FlyingPixelRatio": "flyingPixelRatio",
+                       "ValidTileCoverage": "validTileCoverage", "IdentityMedianDepthChange": "identityMedianDepthChange",
+                       "JointValidDepthRatio": "jointValidDepthRatio", "PriorWarpDepthResidual": "priorWarpDepthResidual"}
+            over = URIRef(f"{NS}{aliases.get(local, local)}")
+            status = HW1.status
         missing = [n for n, t in (("hw1:overProperty", over),
                                   ("hw1:statusProperty", status),
                                   ("hw1:polarity", pol),
@@ -1918,6 +1992,114 @@ def _mask_factor_from_path(mask_file, path):
     return factor
 
 
+_USABLE_LINKS_QUERY = """\
+PREFIX hw1: <%s>
+SELECT ?pairIndex ?source ?target WHERE {
+  ?experiment hw1:producesPair ?pair .
+  ?pair hw1:pairIndex ?pairIndex ;
+        hw1:sourceFrame ?source ;
+        hw1:targetFrame ?target ;
+        hw1:qualificationStatus hw1:Pass .
+  FILTER NOT EXISTS {
+    ?experiment hw1:producesAnnotation ?sourceAnnotation .
+    ?sourceAnnotation hw1:annotatesFrame ?source ;
+                      hw1:qualificationStatus hw1:Fail .
+  }
+  FILTER NOT EXISTS {
+    ?experiment hw1:producesAnnotation ?targetAnnotation .
+    ?targetAnnotation hw1:annotatesFrame ?target ;
+                      hw1:qualificationStatus hw1:Fail .
+  }
+}
+ORDER BY ?pairIndex
+""" % NS
+
+
+def query_graph(graph, query_text):
+    """Run a read-only SPARQL query over an already-loaded local RDF graph.
+
+    This is deliberately a small wrapper around rdflib rather than a service
+    client: a Turtle experiment is its own queryable dataset.  It is public so
+    other local consumers (notably ``reconstruct.py``) use the same query path
+    as the ``api.py query`` command.
+    """
+    try:
+        return graph.query(query_text)
+    except Exception as exc:
+        raise ValueError(f"invalid or unsupported SPARQL query: {exc}") from None
+
+
+def usable_links_from_query(graph, exp_iri):
+    """Return `(source_index, target_index)` usable links via the shared SPARQL rule."""
+    rows = query_graph(graph, _USABLE_LINKS_QUERY)
+    selected = []
+    for row in rows:
+        # The query can see multiple experiments if a caller gives it a combined
+        # graph. `read_experiment` supplies one, but keep this helper safe for
+        # other API consumers by verifying the pair belongs to this experiment.
+        pair = None
+        for candidate in graph.subjects(HW1.pairIndex, row.pairIndex):
+            if ((exp_iri, HW1.producesPair, candidate) in graph and
+                    graph.value(candidate, HW1.sourceFrame) == row.source and
+                    graph.value(candidate, HW1.targetFrame) == row.target):
+                pair = candidate
+                break
+        if pair is not None:
+            selected.append((int(row.pairIndex),
+                             (frame_index_from_iri(row.source),
+                              frame_index_from_iri(row.target))))
+    selected.sort(key=lambda value: value[0])
+    return [link for _, link in selected]
+
+
+def _read_semantic_experiment(g, exp, b, path):
+    """Read explicit Factor occurrences and expose the legacy policy adapter."""
+    # Keep completeness semantics in one shared validator. The adapter fields
+    # below remain for reconstruct.py compatibility, while the report is the
+    # authoritative closed-world diagnostic for new-schema readers.
+    from semantic_model import validate_experiment
+    completion = validate_experiment(g, exp, materialize=False)
+    frames = []
+    for f in g.objects(b, HW1.hasFrame):
+        idx = g.value(f, HW1.frameIndex)
+        rgb = g.value(f, HW1.hasRGBImage); dep = g.value(f, HW1.hasDepthImage)
+        if idx is None or rgb is None or dep is None:
+            raise ValueError(f"{path}: every Batch Frame needs frameIndex, RGBImage and DepthImage")
+        frames.append((int(idx), f, rgb, dep))
+    frames.sort(key=lambda x: x[0])
+    memberships = {x[2]: x[0] for x in frames} | {x[3]: x[0] for x in frames}
+    selected = sorted({_local(x) for x in g.objects(exp, HW1.evaluatesFactor)})
+    factors = list(g.subjects(HW1.inExperiment, exp))
+    seen = set(); frame_status = {idx: True for idx, *_ in frames}; pair_status = {}; masks = {}
+    for node in factors:
+        typ = g.value(node, HW1.hasDefinition)
+        if typ is None:
+            typ = g.value(node, HW1.factorType)
+        cur = g.value(node, HW1.hasCurrentFrame); prev = g.value(node, HW1.hasPrevious)
+        if typ is None or cur not in memberships or (prev is not None and prev not in memberships):
+            raise ValueError(f"{path}: Factor {node} has foreign or incomplete image links")
+        state = g.value(node, HW1.evaluationState)
+        if state == HW1.Measured and (g.value(node, HW1.value) is None or g.value(node, HW1.status) is None):
+            raise ValueError(f"{path}: measured Factor {node} must have exactly one value and status")
+        if prev is None:
+            idx = memberships[cur]; frame_status[idx] = frame_status[idx] and g.value(node, HW1.status) == HW1.Pass
+        else:
+            key = (memberships[prev], memberships[cur]); st = g.value(node, HW1.status)
+            pair_status[key] = pair_status.get(key, True) and st == HW1.Pass
+        for mf in g.objects(node, HW1.maskFile):
+            local = _local(typ); key = (memberships[prev], memberships[cur]) if prev is not None else memberships[cur]
+            masks.setdefault(local, {"frames": {}, "pairs": {}})["pairs" if prev is not None else "frames"][key] = str(mf)
+    ordered = sorted(pair_status)
+    usable = [(i, j) for i, j in ordered if pair_status[(i, j)] and frame_status.get(i, True) and frame_status.get(j, True)]
+    complete = completion.complete
+    return {"exp_iri": URIRef(str(exp)), "exp_name": _experiment_name_from_iri(exp, path),
+            "batch_name": _batch_name_from_batch_iri(b), "batch_iri": URIRef(str(b)),
+            "selected": selected, "settings": _experiment_settings(g, exp, path),
+            "frame_status": frame_status, "pair_status": pair_status,
+            "usable_links": usable, "mask_files": masks, "complete": complete,
+            "completion": completion.to_dict(), "graph": g}
+
+
 def read_experiment(path):
     """Read an ASSESSED experiment .ttl into the dict of §8.2. THE ONE READER.
 
@@ -2000,6 +2182,9 @@ def read_experiment(path):
     if b is None:
         raise ValueError(f"{path}: experiment {exp} has no hw1:onBatch")
 
+    if _graph_uses_semantic_schema(g, exp):
+        return _read_semantic_experiment(g, exp, b, path)
+
     selected = sorted({_local(f) for f in g.objects(exp, HW1.evaluatesFactor)})
     settings = _experiment_settings(g, exp, path)
 
@@ -2062,9 +2247,10 @@ def read_experiment(path):
     usable_links = []
     for _, (i, j), ok in ordered:
         pair_status[(i, j)] = ok
-        # §4.5, the whole rule, once: pair Pass AND both endpoints usable.
-        if ok and frame_status[i] and frame_status[j]:
-            usable_links.append((i, j))
+    # §4.5's usable-link rule is a SPARQL query shared with reconstruct.py.
+    # Keep the validation and the derived status maps above: malformed input must
+    # still fail loudly instead of merely disappearing from a query result.
+    usable_links = usable_links_from_query(g, exp)
 
     return {"exp_iri": URIRef(str(exp)),
             "exp_name": _experiment_name_from_iri(exp, path),
@@ -2373,6 +2559,48 @@ def write_pair_measurements(exp_path, factor_local, measurements):
         raise ValueError(
             f"{exp_path}: cannot write {factor_local}; it was not selected")
     settings = _experiment_settings(full, exp, exp_path)
+
+    # Explicit-occurrence schema: update only returned canonical keys.  Absent
+    # evidence remains Pending, never an invented infinity/Measured result.
+    if _graph_uses_semantic_schema(full, exp):
+        machine = Graph(); machine.parse(data=machine_text, format="turtle")
+        factors = load_quality_factors(); by_pair = {
+            (int(m["source"]), int(m["target"])): dict(m) for m in measurements}
+        info = factors[factor_local]; over = info.get("over", factor_local)
+        names = {"HighFrequencyDepthResidual": "highFrequencyDepthResidual", "FlyingPixelRatio": "flyingPixelRatio",
+                 "ValidTileCoverage": "validTileCoverage", "IdentityMedianDepthChange": "identityMedianDepthChange",
+                 "JointValidDepthRatio": "jointValidDepthRatio", "PriorWarpDepthResidual": "priorWarpDepthResidual"}
+        over = names.get(factor_local, over)
+        image_index = {}
+        for frame in machine.objects(full.value(exp, HW1.onBatch), HW1.hasFrame):
+            idx = full.value(frame, HW1.frameIndex)
+            for image in (full.value(frame, HW1.hasDepthImage), full.value(frame, HW1.hasRGBImage)):
+                if idx is not None and image is not None: image_index[image] = int(idx)
+        written = 0
+        for node in list(machine.subjects(HW1.inExperiment, exp)):
+            node_def = machine.value(node, HW1.hasDefinition)
+            if node_def is None:
+                node_def = machine.value(node, HW1.factorType)
+            if _local(node_def) != factor_local:
+                continue
+            prev, cur = machine.value(node, HW1.hasPrevious), machine.value(node, HW1.hasCurrentFrame)
+            if prev is None or cur is None:
+                continue
+            if prev not in image_index or cur not in image_index:
+                raise ValueError(f"{exp_path}: deferred Factor {node} points outside Batch structure")
+            i, j = image_index[prev], image_index[cur]
+            m = by_pair.get((i, j)); machine.remove((node, HW1.value, None)); machine.remove((node, HW1.status, None)); machine.remove((node, HW1.evaluationState, None))
+            if m is None:
+                machine.add((node, HW1.evaluationState, HW1.Pending)); continue
+            value = _storable(float(m.get("value", float("nan"))))
+            machine.add((node, HW1.value, _double_literal(value))); machine.add((node, HW1.status, status_for(over, value, settings, factors))); machine.add((node, HW1.evaluationState, HW1.Measured)); written += 1
+            if "count" in m: machine.remove((node, HW1.supportCount, None)); machine.add((node, HW1.supportCount, Literal(int(m["count"]), datatype=XSD.integer)))
+        # Recompute completion from explicit state; preserve declaration bytes.
+        machine.remove((exp, RDF.type, HW1.FullEvaluatedFrames))
+        occurrences = list(machine.subjects(HW1.inExperiment, exp))
+        if occurrences and all(machine.value(n, HW1.evaluationState) == HW1.Measured for n in occurrences): machine.add((exp, RDF.type, HW1.FullEvaluatedFrames))
+        _write_machine_section(exp_path, student_text, machine)
+        return written
 
     by_pair = {(int(m["source"]), int(m["target"])): dict(m)
                for m in measurements}
@@ -2791,7 +3019,7 @@ def cmd_declare(args):
         raise SystemExit(f"[declare] {exc}")
     _warn_stem_gaps(frames, prefix="[declare]")
     name_of_batch = batch_name(data_dir, floor)
-    batch = batch_iri(name_of_batch)
+    batch = data_batch_iri(name_of_batch)
 
     decls = load_parameter_declarations(_ONTOLOGY_TTL)
     factors = load_quality_factors(_ONTOLOGY_TTL)
@@ -2830,14 +3058,17 @@ def cmd_declare(args):
         "# =============================================================================",
         "",
         "@prefix hw1:  <http://taica.course/hw1/ontology#> .",
+        f"@prefix batch: <{DATA_NS}batch/> .",
+        f"@prefix exp:   <{DATA_NS}experiment/> .",
         "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
         "@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .",
         "",
-        f"<{NS}experiment/{name}>",
+        f"exp:{name}",
         "    a hw1:Experiment ;",
+        "    hw1:schemaVersion \"5.0.0\" ;",
         f"    rdfs:label \"TODO: one line naming the condition this experiment tests\"@en ;",
         f"    hw1:batchFile \"{batch_file_text}\" ;",
-        f"    hw1:onBatch <{batch}> ;   # {name_of_batch}",
+        f"    hw1:onBatch batch:{name_of_batch} ;   # {name_of_batch}",
         "    hw1:evaluatesFactor",
         f"        {selection_text} .",
         "",
@@ -2999,7 +3230,7 @@ _PAIR_OBSERVABLES = {
 # they wanted next to the data that disagrees with it, and nothing downstream
 # could tell that apart from a measurement.
 _DECLARATION_EXPERIMENT_PREDICATES = (
-    RDF.type, RDFS.label, HW1.batchFile, HW1.onBatch, HW1.evaluatesFactor,
+    RDF.type, RDFS.label, HW1.schemaVersion, HW1.batchFile, HW1.onBatch, HW1.evaluatesFactor,
     HW1.hasFactorSetting)
 _DECLARATION_SETTING_PREDICATES = (
     RDF.type, HW1.settingParameter, HW1.settingRole, HW1.settingForFactor,
@@ -3178,7 +3409,7 @@ def _capture_dir(batch_path, batch_file):
         f"the capture directory itself.")
 
 
-def _resolve_declared_capture(batch_file, on_batch, path, exp, bf):
+def _resolve_declared_capture(batch_file, on_batch, path, exp, bf, *, semantic=False):
     """hw1:batchFile + hw1:onBatch -> (data_dir, batch_iri, batch_name).
 
     Preferred: `hw1:batchFile` names the capture directory (rgb/ + depth/).
@@ -3193,7 +3424,7 @@ def _resolve_declared_capture(batch_file, on_batch, path, exp, bf):
     resolved = _resolve_batch_file(batch_file)
     if _is_capture_dir(resolved):
         if on_batch is None:
-            expected = batch_iri(batch_name(resolved, 1))
+            expected = data_batch_iri(batch_name(resolved, 1)) if semantic else batch_iri(batch_name(resolved, 1))
             raise ValueError(
                 f"{path}: the experiment declares no hw1:onBatch. State the batch "
                 f"IRI of the capture at {batch_file!r} — it is checked against the "
@@ -3210,7 +3441,7 @@ def _resolve_declared_capture(batch_file, on_batch, path, exp, bf):
                 f"(expected {NS}batch/floor<N>_<capture-dir-basename>). {exc} "
                 f"Offending triple:\n    {_fmt_triple(exp, HW1.onBatch, on_batch)}")
         expected_name = batch_name(resolved, floor)
-        expected_iri = batch_iri(expected_name)
+        expected_iri = data_batch_iri(expected_name) if semantic else batch_iri(expected_name)
         if URIRef(str(on_batch)) != expected_iri:
             raise ValueError(
                 f"{path}: hw1:onBatch names {_fmt_term(on_batch)} but the capture "
@@ -3409,8 +3640,10 @@ def read_declaration(path):
             f"the current working directory when relative)")
     batch_file = str(bf)
     on_batch = g.value(exp, HW1.onBatch)
+    schema_version = str(g.value(exp, HW1.schemaVersion) or "4.0.0")
     data_dir, batch, batch_name_str = _resolve_declared_capture(
-        batch_file, on_batch, path, exp, bf)
+        batch_file, on_batch, path, exp, bf,
+        semantic=schema_version.startswith("5"))
 
     # ── the selection ─────────────────────────────────────────────────────────
     selected_terms = list(g.objects(exp, HW1.evaluatesFactor))
@@ -3543,6 +3776,7 @@ def read_declaration(path):
 
     return {"exp_iri": URIRef(str(exp)),
             "exp_name": exp_name,
+            "schema_version": schema_version,
             "batch_file": batch_file,
             "batch_iri": URIRef(str(batch)),
             "batch_name": batch_name_str,
@@ -3748,6 +3982,113 @@ def _check_batch_file(batch_ttl, name, expected_frames):
             f"--data-dir <dir> --floor <n>`.")
 
 
+def _semantic_schema_enabled(path=_ONTOLOGY_TTL):
+    """Return whether the installed TBox advertises explicit Factor occurrences."""
+    try:
+        ontology = Graph()
+        ontology.parse(path, format="turtle")
+        return ((HW1.Factor, RDF.type, RDFS.Class) in ontology or
+                any(ontology.triples((None, RDFS.subClassOf, HW1.Factor))))
+    except Exception:
+        return False
+
+
+def _graph_uses_semantic_schema(graph, experiment):
+    """Opt into the Factor model per artifact, while retaining legacy reads."""
+    version = graph.value(experiment, HW1.schemaVersion)
+    if version is not None:
+        try:
+            return int(str(version).split('.', 1)[0]) >= 5
+        except (TypeError, ValueError):
+            return False
+    return any(graph.subjects(HW1.inExperiment, experiment))
+
+
+def factor_iri(expname, factor_local, current_idx, previous_idx=None):
+    """Canonical readable key for a single-image or ordered pair occurrence."""
+    local = (f"{factor_local}_{int(previous_idx)}_{int(current_idx)}"
+             if previous_idx is not None else f"{factor_local}_{int(current_idx)}")
+    return URIRef(f"{NS}experiment/{expname}/factor/{local}")
+
+
+def _semantic_factor_info(factors, factor_local):
+    info = factors.get(factor_local, {})
+    over = info.get("over", factor_local)
+    return over, info
+
+
+def _bind_readable_namespaces(g, batch_name_str, expname):
+    """Bind only legal, reusable bases so Turtle does not repeat the project IRI."""
+    g.bind("hw1", HW1); g.bind("schema", SCHEMA); g.bind("xsd", XSD)
+    g.bind("batch", Namespace(f"{DATA_NS}batch/"))
+    g.bind("frame", Namespace(f"{DATA_NS}batch/{batch_name_str}/frame/"))
+    g.bind("rgb", Namespace(f"{DATA_NS}batch/{batch_name_str}/rgb/"))
+    g.bind("depth", Namespace(f"{DATA_NS}batch/{batch_name_str}/depth/"))
+    g.bind("exp", Namespace(f"{DATA_NS}experiment/"))
+    g.bind("factor", Namespace(f"{DATA_NS}experiment/{expname}/factor/"))
+    g.bind("setting", Namespace(f"{DATA_NS}experiment/{expname}/setting/"))
+    g.bind("run", Namespace(f"{DATA_NS}experiment/{expname}/run/"))
+
+
+def _build_semantic_machine_graph(decl, data_dir, digest, decls, factors,
+                                  artifact_root=None, artifact_relative_to=None):
+    """Write a complete structural snapshot and one explicit Factor per key."""
+    exp, expname = decl["exp_iri"], decl["exp_name"]
+    name, settings, selected = decl["batch_name"], decl["required"], decl["selected"]
+    frames = _pair_frames(data_dir); g = Graph()
+    _bind_readable_namespaces(g, name, expname)
+    b = data_batch_iri(name)
+    g.add((exp, HW1.declarationDigest, Literal(digest))); g.add((exp, HW1.onBatch, b))
+    g.add((b, RDF.type, HW1.Batch)); g.add((b, HW1.batchName, Literal(name)))
+    g.add((b, HW1.batchPath, Literal(data_dir)))
+    for stem, rgb_path, depth_path in frames:
+        f = data_frame_iri(name, stem); rgb = data_component_iri(name, stem, "rgb"); dep = data_component_iri(name, stem, "depth")
+        g.add((b, HW1.hasFrame, f)); g.add((f, RDF.type, HW1.Frame)); g.add((f, HW1.frameIndex, Literal(int(stem), datatype=XSD.integer)))
+        g.add((f, HW1.hasRGBImage, rgb)); g.add((rgb, RDF.type, HW1.RGBImage)); g.add((rgb, SCHEMA.contentUrl, Literal(rgb_path)))
+        g.add((f, HW1.hasDepthImage, dep)); g.add((dep, RDF.type, HW1.DepthImage)); g.add((dep, SCHEMA.contentUrl, Literal(depth_path)))
+    for param in sorted(set(settings) - set(decl["given"])):
+        d = decls[param]; s = data_setting_iri(expname, d["primary"], param)
+        for triple in ((exp, HW1.hasFactorSetting, s), (s, RDF.type, HW1.FactorSetting), (s, HW1.settingParameter, d["iri"]),
+                       (s, HW1.settingRole, HW1[d["role"]]), (s, HW1.settingForFactor, d["primaryIri"])): g.add(triple)
+        g.add((s, HW1.settingValue, _setting_value_literal(settings[param], d["kind"])))
+    count = 0; measured = 0
+    for factor_local in selected:
+        over, _ = _semantic_factor_info(factors, factor_local)
+        if over in _FRAME_OBSERVABLES:
+            spec = _FRAME_OBSERVABLES[over]
+            for stem, rgb_path, depth_path in frames:
+                node = data_factor_iri(expname, factor_local, stem); image = data_component_iri(name, stem, spec["modality"])
+                g.add((node, RDF.type, HW1.Factor)); g.add((node, RDF.type, HW1.SingleImageFactor)); g.add((node, HW1.inExperiment, exp)); g.add((node, HW1.hasDefinition, HW1[factor_local])); g.add((node, HW1.hasCurrentFrame, image))
+                # targetKind/evaluationPhase describe the reusable FactorDefinition
+                # in the TBox; the occurrence carries only its
+                # hasDefinition link and measured result.
+                if "measure_mask" in spec:
+                    value, mask, _count = _measured_with_mask(over, factors, f"frame {stem}", spec["measure_mask"], rgb_path, depth_path, settings)
+                else:
+                    value, mask = _measured(over, factors, f"frame {stem}", spec["measure"], rgb_path, depth_path, settings), None
+                g.add((node, HW1.value, _double_literal(value))); g.add((node, HW1.status, status_for(over, _storable(value), settings, factors))); g.add((node, HW1.evaluationState, HW1.Measured)); measured += 1; count += 1
+                if mask is not None:
+                    mf = _write_mask_artifact(mask, artifact_root, artifact_relative_to, factor_local, f"{stem}.png")
+                    if mf: g.add((node, HW1.maskFile, Literal(mf)))
+        elif over in _PAIR_OBSERVABLES:
+            spec = _PAIR_OBSERVABLES[over]
+            for (s0, _, d0), (s1, _, d1) in zip(frames, frames[1:]):
+                i, j = int(s0), int(s1); node = data_factor_iri(expname, factor_local, j, i)
+                g.add((node, RDF.type, HW1.Factor)); g.add((node, RDF.type, HW1.DepthPairFactor)); g.add((node, HW1.inExperiment, exp)); g.add((node, HW1.hasDefinition, HW1[factor_local]))
+                g.add((node, HW1.hasPrevious, data_component_iri(name, s0, "depth"))); g.add((node, HW1.hasCurrentFrame, data_component_iri(name, s1, "depth"))); count += 1
+                if spec.get("deferred"):
+                    g.add((node, HW1.evaluationState, HW1.Pending))
+                else:
+                    value, mask, support = _measured_with_mask(over, factors, f"pair {i}_{j}", spec["measure_mask"], d0, d1, settings)
+                    g.add((node, HW1.value, _double_literal(value))); g.add((node, HW1.status, status_for(over, _storable(value), settings, factors))); g.add((node, HW1.evaluationState, HW1.Measured)); measured += 1
+                    if mask is not None:
+                        mf = _write_mask_artifact(mask, artifact_root, artifact_relative_to, factor_local, f"{i}_{j}.png")
+                        if mf: g.add((node, HW1.maskFile, Literal(mf)))
+                    if spec.get("count_property"): g.add((node, HW1.supportCount, Literal(int(support or 0), datatype=XSD.integer)))
+    if count and count == measured: g.add((exp, RDF.type, HW1.FullEvaluatedFrames))
+    return g, {"frames": len(frames), "factors": count, "annotations": 0, "pairs": 0}
+
+
 def build_machine_graph(decl, data_dir, digest, decls=None, factors=None,
                         artifact_root=None, artifact_relative_to=None):
     """Measure what the declaration selected. -> (graph, counts). The MACHINE SECTION.
@@ -3806,6 +4147,16 @@ def build_machine_graph(decl, data_dir, digest, decls=None, factors=None,
     """
     decls = load_parameter_declarations(_ONTOLOGY_TTL) if decls is None else decls
     factors = load_quality_factors(_ONTOLOGY_TTL) if factors is None else factors
+
+    # New TBoxes advertise hw1:Factor; route only that schema through the
+    # occurrence writer.  Legacy artifacts continue through the container adapter
+    # below, which is important for historical course fixtures.
+    # The declaration's explicit schemaVersion selects the writer.  This keeps
+    # historical v4 declarations readable while new scaffolds emit v5 Factors.
+    if str(decl.get("schema_version", "")).startswith("5"):
+        return _build_semantic_machine_graph(
+            decl, data_dir, digest, decls, factors,
+            artifact_root=artifact_root, artifact_relative_to=artifact_relative_to)
 
     exp = decl["exp_iri"]
     expname = decl["exp_name"]
@@ -4335,6 +4686,13 @@ def _classify(path):
     assessed = _marker_offset(text) is not None
 
     if batches and exps:
+        # v5 assessed files intentionally embed the Batch snapshot so a single
+        # Turtle file is self-contained for SPARQL. Legacy v4 batch sidecars and
+        # experiment files remain mutually exclusive.
+        version = g.value(exps[0], HW1.schemaVersion)
+        has_factors = any(g.subjects(HW1.inExperiment, exps[0]))
+        if (version is not None and str(version).startswith("5")) or has_factors:
+            return "experiment" if assessed else "declaration"
         raise ValueError(
             f"{path}: this file declares BOTH a hw1:Batch ({batches[0]}) and a "
             f"hw1:Experiment ({exps[0]}). §3 keeps them in separate "
@@ -4837,7 +5195,7 @@ def _failing_nodes(g, factors, factor_local, this_run):
     """Every node whose `hw1:statusProperty` for this factor reads hw1:Fail.
 
     THE GENERIC RESOLUTION, and the whole reason the TBox keeps the
-    `statusProperty` wiring after the SPARQL layer was deleted (§10): this is
+    `statusProperty` wiring remains useful alongside SPARQL: this is
     `?factor hw1:statusProperty ?sp . ?node ?sp hw1:Fail .` in Python, with no
     predicate enumerated and no factor named. A menu factor added to the TBox is
     picked up here with no edit.
@@ -5209,6 +5567,51 @@ def _view_compare(paths):
     return 0
 
 
+def _query_rows(result):
+    """Return a stable `(headers, rows)` projection for a SPARQL SELECT result."""
+    headers = [str(var) for var in result.vars]
+    rows = []
+    for row in result:
+        rows.append(["" if row[var] is None else str(row[var]) for var in result.vars])
+    return headers, rows
+
+
+def cmd_query(args):
+    """Run a student-authored SPARQL query over one local Turtle file, read-only."""
+    if not os.path.isfile(args.path):
+        raise ValueError(f"{args.path!r}: query needs a local Turtle file")
+    query_text = args.query_text if args.query_text is not None else _read_text(args.query_file)
+    graph = Graph()
+    try:
+        graph.parse(data=_read_text(args.path), format="turtle")
+    except Exception as exc:
+        raise ValueError(f"{args.path}: not valid Turtle: {exc}") from None
+    result = query_graph(graph, query_text)
+
+    if result.type == "SELECT":
+        headers, rows = _query_rows(result)
+        if args.format == "csv":
+            writer = csv.writer(sys.stdout)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        elif args.format == "json":
+            print(json.dumps([dict(zip(headers, row)) for row in rows], indent=2))
+        else:
+            _print_table(headers, rows)
+        return 0
+    if result.type == "ASK":
+        answer = bool(result.askAnswer)
+        print(json.dumps({"boolean": answer}) if args.format == "json"
+              else str(answer).lower())
+        return 0
+
+    # CONSTRUCT and DESCRIBE results are graphs. Turtle is the useful default;
+    # `--format json` selects a standards-friendly JSON-LD serialization.
+    serialization = "json-ld" if args.format == "json" else "turtle"
+    print(result.graph.serialize(format=serialization), end="")
+    return 0
+
+
 def cmd_explore(args):
     """Print what a .ttl file says. READ-ONLY: measures nothing, writes nothing.
 
@@ -5339,12 +5742,12 @@ def cut_contiguous_segments(usable_links):
 # =============================================================================
 def _build_parser():
     p = argparse.ArgumentParser(
-        description="HW1 data-quality CLI (rdflib only). Scaffold a DECLARATION "
+        description="HW1 data-quality CLI (rdflib + local SPARQL). Scaffold a DECLARATION "
                     "over a capture directory (declare), assess it (experiment), "
                     "and read the result back as terminal tables (explore). "
                     "batch2ttl is a deprecated optional sidecar for generation "
-                    "provenance. reconstruct.py completes the suite. No server, "
-                    "no daemon, no SPARQL: capture directories and .ttl files.",
+                    "provenance. reconstruct.py completes the suite. SPARQL runs "
+                    "locally over .ttl files; no server or daemon is required.",
         epilog="A measured value means nothing without the settings it was "
                "measured and judged under, so the settings live in the same file "
                "as the values — the student's own declaration, which is "
@@ -5455,6 +5858,20 @@ def _build_parser():
                           "the comparison view (§7.1). Writes nothing "
                           "and measures nothing.")
     exl.set_defaults(func=cmd_explore)
+
+    qry = sub.add_parser(
+        "query",
+        help="Run a read-only SPARQL query over one local Turtle file. Use a .rq "
+             "file for reusable student queries; no triplestore is required.")
+    qry.add_argument("path", help="Declaration, assessed experiment, or batch Turtle file.")
+    source = qry.add_mutually_exclusive_group(required=True)
+    source.add_argument("--query-file", metavar="FILE",
+                        help="UTF-8 .rq file containing a SPARQL SELECT, ASK, CONSTRUCT, or DESCRIBE query.")
+    source.add_argument("--query-text", metavar="SPARQL",
+                        help="Inline SPARQL query (quote it in the shell).")
+    qry.add_argument("--format", choices=("table", "csv", "json"), default="table",
+                     help="SELECT: table (default), csv, or json; graph results: Turtle or JSON-LD.")
+    qry.set_defaults(func=cmd_query)
 
     return p
 

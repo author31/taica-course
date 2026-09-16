@@ -29,8 +29,9 @@ WHAT V3 CHANGED, AND WHAT THIS FILE THEREFORE TESTS
         (`SelectionScoping`, `ModalityAnnotations`);
       * pairs are ALWAYS minted, and both vacuous-pass readings of the usable-link
         rule are pinned (`PairMinting`, `VacuousPassLinks`);
-      * the SPARQL layer is gone; attribution is `explore`'s verdict section,
-        checked on a fixture engineered to fail a named factor (`ExploreVerdict`).
+      * local SPARQL queries and `explore` both inspect the same sealed graph;
+        attribution is checked on a fixture engineered to fail a named factor
+        (`ExploreVerdict`).
 
 WHAT SURVIVED UNCHANGED
     1. THE FRAME MEASURERS, against fixtures whose values are CLOSED FORM — a
@@ -55,12 +56,12 @@ WHAT SURVIVED UNCHANGED
        `mapMeanL2`, because `completeness.py` does exactly that and a
        delete-everything implementation destroys the deliverable silently.
 
-NO DIGEST IDENTITY, NO `query`, NO THRESHOLDS FILE
+NO DIGEST IDENTITY, NO THRESHOLDS FILE
     `experiment_digest`, `hw1:experimentId`, `--exp-id` and the 8-hex file names
     are deleted (contracts §6/§11): an experiment is identified by its NAME, which
     is the declaration file's stem and the IRI tail, and the two must agree. The
-    `query` command, `hw1/queries/*.rq` and the pyoxigraph dependency are deleted
-    too (§10) — `explore` prints the projections those queries used to compute.
+    Local `query` executes student `.rq` files with rdflib; pyoxigraph remains
+    absent from the stack.
 
     Qualification thresholds are still never read from the TBox by a test that
     predicts a status: contracts §5 marks all eight PROVISIONAL until the OFAT
@@ -4572,9 +4573,9 @@ def _number_is_printed(text, value):
 class ExploreCommand(unittest.TestCase):
     """The four views of contracts §7.1, and the rule that governs all of them.
 
-    `explore` replaced the whole SPARQL layer (§10): every shipped query became a
-    projection over one self-contained file, and projections are this command's
-    job. So the assertions here are about CONTENT — the batch is named, the
+    `explore` is the guided projection over one self-contained file; `query`
+    supports students' ad-hoc SPARQL questions. So these assertions are about
+    CONTENT — the batch is named, the
     selection is listed, the given/defaulted split is visible, the run values are
     printed — never about column widths or box-drawing characters.
     """
@@ -4862,7 +4863,7 @@ class ExploreVerdict(unittest.TestCase):
 # 14. The command surface and the single-graph invariant — contracts §3/§7/§8
 # =============================================================================
 class CommandSurface(unittest.TestCase):
-    """Four api.py commands (contracts §7), and the flags v3 deleted.
+    """Five api.py commands (contracts §7), and the obsolete flags deleted.
 
     `experiment` takes EXACTLY ONE positional argument now. Every flag it used to
     carry described part of the experiment, and every one of them moved into the
@@ -4870,23 +4871,17 @@ class CommandSurface(unittest.TestCase):
     scaffolds the student section of a declaration; it assesses nothing.
     """
 
-    def test_exactly_four_subcommands_are_offered(self):
-        """Read off the parser's own help, so a fifth cannot slip in unnoticed."""
+    def test_exactly_five_subcommands_are_offered(self):
+        """Read off the parser's own help, so an unreviewed command cannot slip in."""
         text = _capture_help(["--help"])
         match = re.search(r"\{([A-Za-z0-9_,\-]+)\}", text)
         self.assertIsNotNone(match, f"no subcommand list in --help:\n{text}")
         self.assertEqual(match.group(1).split(","),
-                         ["batch2ttl", "declare", "experiment", "explore"])
+                         ["batch2ttl", "declare", "experiment", "explore", "query"])
 
-    def test_the_dead_subcommands_are_rejected(self):
-        """contracts §7/§10/§11: `query` is deleted, and so are v1's three.
-
-        Not deprecated — gone. A `query` that still parsed would keep pyoxigraph in
-        the dependency set and the `.rq` files in the tree, and the student would
-        have two ways to ask the same question, one of which is no longer
-        maintained.
-        """
-        for command in ("query", "load", "select", "result"):
+    def test_the_obsolete_subcommands_are_rejected(self):
+        """The old service-oriented commands stay gone; local `query` replaces none."""
+        for command in ("load", "select", "result"):
             with self.subTest(command=command):
                 with self.assertRaises(_REJECTED):
                     _main([command])
@@ -4961,7 +4956,7 @@ class CommandSurface(unittest.TestCase):
         models disagree about what identifies an experiment and where a verdict
         comes from.
         """
-        for name in ("experiment_digest", "cmd_query", "cmd_load", "cmd_select",
+        for name in ("experiment_digest", "cmd_load", "cmd_select",
                      "cmd_result", "write_result", "selection_digest",
                      "build_pair_grading_query", "load_knob_declarations",
                      "parse_knob_arg", "load_result_measures", "DQV",
@@ -4979,19 +4974,18 @@ class CommandSurface(unittest.TestCase):
                      "frame_index_from_iri", "batch_name_from_frame_iri",
                      "load_parameter_declarations", "parse_setting_arg",
                      "load_quality_factors", "status_for", "read_declaration",
-                     "read_experiment", "write_run", "cut_contiguous_segments"):
+                     "read_experiment", "write_run", "cut_contiguous_segments",
+                     "cmd_query", "query_graph", "usable_links_from_query"):
             with self.subTest(name=name):
                 _require(name)
 
     def test_the_deleted_files_are_gone_from_the_tree(self):
         """contracts §3/§10's deletion lists.
 
-        `hw1/queries/` in particular is not inert: four `.rq` files that no command
-        can run are four documents a student will try to use, and the first thing
-        they will reach for is the `query` command that no longer exists.
-        `.oxigraph_db/` is worse — a RocksDB directory that takes a write lock.
+        `.oxigraph_db/` is a RocksDB directory that takes a write lock. Student
+        `.rq` files are supported by the local `query` command and are excluded.
         """
-        for relative in ("queries", ".oxigraph_db", "thresholds.json",
+        for relative in (".oxigraph_db", "thresholds.json",
                          "thresholds.schema.json", "run.py",
                          os.path.join("ontology", "bands.ttl")):
             with self.subTest(path=relative):
@@ -5026,8 +5020,8 @@ class SingleGraphSerialization(unittest.TestCase):
 
     Turtle cannot carry a graph name, which is exactly why v1's loader needed a
     `to_graph` argument per file and why one missed flag emptied every named graph
-    silently. v2 removed the possibility rather than the mistake, and v3 goes
-    further: with the query layer deleted there is no store to load anything into.
+    silently. v2 removed the possibility rather than the mistake; local SPARQL
+    queries likewise operate over a single in-memory graph.
     """
 
     @classmethod

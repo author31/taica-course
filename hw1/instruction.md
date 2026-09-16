@@ -87,11 +87,9 @@ pixi run -e habitat python hw1/api.py explore <capture-dir>
 ```
 
 `explore` reads the capture directory (rgb/ + depth/) directly — frames, image
-paths, stem gaps — and prints it. There is no `batch.ttl` step. Generation
-provenance (`api.py batch2ttl --gen name=value --derived-from`, writing an
-optional sidecar) is recorded only when the actual generator level is known;
-never invent one — an absent GenerationSetting means "not asserted", not
-"clean".
+paths, stem gaps — and prints it. There is no `batch.ttl` step. A Generation
+setting is recorded only when the actual generator level is known; never
+invent one — an absent GenerationSetting means "not asserted", not "clean".
 
 ## 4. The experiment-centric design
 
@@ -116,31 +114,65 @@ The workflow loop:
 
 ### 4.1 The ontology engine: rdflib only
 
-There is **no triple store, no SPARQL, no server, no named graphs, no OWL
+There is **no triple store, no server, no named graphs, and no OWL
 reasoning**. The engine is `hw1/api.py` + [rdflib](https://rdflib.readthedocs.io/):
 plain Turtle files parsed into a single graph, validated, extended, and
-serialized back. Four subcommands (`reconstruct.py` is the fifth command of
-the suite):
+serialized back. Local SPARQL runs over those files for inspection and for
+personal selection policies; no service is required. Five subcommands
+(`reconstruct.py` is the sixth command of the suite):
 
 | Command | Does | Writes |
 |---|---|---|
 | `api.py explore <capture-dir or .ttl>…` | read-only terminal tables; several files → comparison view | nothing |
 | `api.py declare --data-dir` | scaffold a declaration (prefixes, capture join, factor selection, PREDICTION TODOs); never assesses | `hw1/experiments/<name>.ttl` (refuses to overwrite) |
 | `api.py experiment <decl.ttl>` | assess one declaration, **once**, then seal | machine section of the same file |
+| `api.py query <file.ttl> --query-file <question.rq>` | run a student-authored local SPARQL query | nothing |
 | `reconstruct.py --experiment` | baseline + selected runs, outcomes into the sealed file | run nodes + diagnostics JSON |
-| `api.py batch2ttl` | **deprecated.** optional sidecar for `--gen` / `--derived-from` provenance | `<capture>/batch.ttl` |
 
 Everything the semantic layer computes — statuses, verdicts, attribution — is
 baked into the files at assessment time and read back with `explore`. The
 `.ttl` files *are* the state; version-control them like lab notes.
 
+Use `api.py query` whenever you want to inspect the RDF directly. For example,
+the shipped [`queries/usable_links.rq`](queries/usable_links.rq) shows the
+status rule that feeds reconstruction's selected-segment probe:
+
+```bash
+pixi run -e habitat python hw1/api.py query hw1/experiments/my_first_test.ttl \
+  --query-file hw1/queries/usable_links.rq
+```
+
+You can also make a personal frame assessment drive the selected reconstruction.
+Write a SPARQL `SELECT` that binds either `?frame` (a HW1 frame IRI) or
+`?frameIndex` (an integer), then pass it to reconstruction. Its result is
+validated against the experiment and split into contiguous temporal segments:
+
+```bash
+pixi run -e habitat python hw1/reconstruct.py \
+  --data_root eval/_data/first_floor/baseline \
+  --experiment hw1/experiments/my_first_test.ttl \
+  --selection-query hw1/queries/personal_passing_frames.rq --no-vis
+```
+
 ### 4.2 The TBox: `hw1/ontology/hw1.ttl`
 
 The ontology file is the single source of truth for *names and defaults*. You
 read it (and `definitions.md`) to know what is declarable; you never edit it.
-Three things it defines:
+It defines:
 
-**The factor menu** — 8 selectable quality factors, all computed from raw
+**Factor definitions vs factor measurements** — the two levels share the word
+"factor" and must not be confused (see `DL.md` for the full logic):
+
+- `FactorDefinition` (IRI `hw1:QualityFactor`) is reusable and ownerless: what
+  a number means, which direction is better (`polarity`), which parameter holds
+  the threshold (`qualifiedBy`), and which images it applies to (`targetKind`).
+- `FactorMeasurement` (IRI `hw1:Factor`) is one experiment-scoped occurrence:
+  `inExperiment` + `hasDefinition` + `hasCurrentFrame` (plus `hasPrevious` for
+  pairs) + uniform `value` / `status` / `evaluationState`. New writers emit
+  `hw1:hasDefinition`; `hw1:factorType` is accepted as the same link for
+  compatibility. Shared Batch/Frame/image nodes never carry results.
+
+**The factor menu** — 8 selectable definitions, all computed from raw
 rasters (numpy + Pillow):
 
 | Factor | Observable | Polarity | Default threshold |
@@ -159,6 +191,14 @@ or Fail — the control your chosen factors are supposed to beat), and the two
 run-level factors that are always evaluated, never selected:
 `hw1:ReconstructionAccuracy` over `mapMeanL2` (`maxMapMeanL2` 0.80 m) and
 `hw1:Coverage` over `coverageF` (`minCoverageF` 0.40).
+
+**Completion, not qualification** — `hw1:FullEvaluatedFrames` is bound to the
+Experiment: it holds iff every expected measurement for that experiment's
+selection exists exactly once and is `Measured` with one numeric value and one
+correctly graded status. All values may Fail; Pending, missing, errored,
+wrong-modality, unexpected, or duplicate measurements block completion. The
+validator materializes or removes the type; production selection requires it,
+inspection may read incomplete graphs.
 
 **Parameters and their roles** — every settable number is a declared
 `hw1:Parameter` with a role that *is* the verdict vocabulary:
@@ -208,17 +248,19 @@ Minimal anatomy of what it scaffolds:
 
 <http://taica.course/hw1/ontology#experiment/my_first_test>
     a hw1:Experiment ;
+    hw1:schemaVersion "5.0.0" ;
     rdfs:label "depth-glitch hypothesis, stock measurement, re-cut outcome line"@en ;
     hw1:batchFile "<capture-dir>" ;
-    hw1:onBatch <http://taica.course/hw1/ontology#batch/floor1_<capture-name>> ;
+    hw1:onBatch <http://taica.course/hw1/data/batch/floor1_<capture-name>> ;
     hw1:evaluatesFactor hw1:HighFrequencyDepthResidual .
 ```
 
 Rules that bite: the file stem **must equal** the IRI tail
 (`my_first_test.ttl` ↔ `…experiment/my_first_test` — naming your experimental
-conditions is part of designing them); `hw1:onBatch` must match
-`floor<N>_<capture-dir-basename>` for the directory named in `hw1:batchFile`;
-the selection is 1–8 menu factors.
+conditions is part of designing them); `hw1:onBatch` must use the **data**
+namespace (`http://taica.course/hw1/data/batch/floor<N>_<capture-dir-basename>`)
+for the directory named in `hw1:batchFile` — the ontology namespace form is
+rejected as a capture mismatch; the selection is 1–8 menu factors.
 
 **Overriding a setting** — a `hw1:FactorSetting` blank node per override.
 Qualification example (tighten a factor's Pass line):
@@ -252,11 +294,14 @@ pixi run -e habitat python hw1/api.py explore hw1/experiments/my_first_test.ttl
 pixi run -e habitat python hw1/api.py experiment hw1/experiments/my_first_test.ttl
 ```
 
-This measures the selection, writes per-frame annotations (per modality:
-values + statuses + a per-modality `qualificationStatus`), mints frame pairs,
-fills defaults, and appends it all below a machine marker with a
-`declarationDigest` sealing the student section. Re-assessment is a hard
-error. To change anything, copy the student section to a new name.
+This measures the selection and writes one `hw1:Factor` measurement per
+expected occurrence (`inExperiment` + `hasDefinition` + image links + `value`
+/ `status` / `evaluationState`), plus per-frame annotations (per modality:
+values + statuses + a per-modality `qualificationStatus`) and frame pairs. It
+fills defaults, materializes `hw1:FullEvaluatedFrames` when every expected
+occurrence validates as `Measured`, and appends it all below a machine marker
+with a `declarationDigest` sealing the student section. Re-assessment is a
+hard error. To change anything, copy the student section to a new name.
 
 **Reconstruct — the control and the probe:**
 
@@ -269,7 +314,11 @@ pixi run -e habitat python hw1/reconstruct.py \
 Two runs by default: `baseline` (every frame) and `selected` (maximal
 usable-link segments — a link is usable iff the pair passed and both endpoint
 frames passed). The selected run is a **falsification probe** of "the failed
-frames are harming ICP", not a promised repair. Both record `mapMeanL2` and
+frames are harming ICP", not a promised repair. A personal `SELECT` query
+(`--selection-query`, binding `?frame` or `?frameIndex`; see
+`hw1/queries/personal_passing_frames.rq`) may override the verdict-driven
+selection for the selected run — it is validated against the experiment's
+frames and cut into contiguous segments. Both record `mapMeanL2` and
 `gatedSteps`; selected adds `spliceCount` and `maxGapLength`. Interpreting the
 differential:
 
@@ -290,6 +339,12 @@ walk, ending at a Generation setting on the batch:
 ```bash
 pixi run -e habitat python hw1/api.py explore hw1/experiments/first_floor_uniform_injected_v7.ttl
 ```
+
+Vocabulary check (current writers): the sealed experiment
+`hw1/experiments/corrupted_verify_hasdef.ttl` over
+`eval/_data/first_floor/corrupted` emits `hw1:hasDefinition` on every Factor
+occurrence and materializes `hw1:FullEvaluatedFrames` — the shape new
+declarations must verify against.
 
 **Inspect visually** — the dashboard projects the same sealed files: factor
 timelines with thresholds, linked RGB/depth frame viewer, run outcomes with

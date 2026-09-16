@@ -28,6 +28,32 @@ temporal links and creates segment splices that can dominate the result. The
 run therefore records gate/splice/gap evidence alongside trajectory error and,
 when a clean reference is supplied, map coverage.
 
+## Frame selection: default verdicts or your own SPARQL
+
+The selected run defaults to the experiment's baked verdicts:
+`api.read_experiment` derives `usable_links` — the conjunction over all
+selected factors — and `reconstruct.py` cuts them into maximal contiguous
+segments. Production selection requires `FullEvaluatedFrames`.
+
+Students may override the combination with a personal policy:
+
+```bash
+pixi run -e habitat python hw1/reconstruct.py \
+  --data_root eval/_data/first_floor/baseline \
+  --experiment hw1/experiments/my_first_test.ttl \
+  --selection-query hw1/queries/personal_passing_frames.rq --no-vis
+```
+
+Contract: a local SPARQL `SELECT` binding `?frame` (frame IRI) or `?frameIndex`
+(integer); `?experiment` is bound by the runner. Results are validated against
+the experiment's frames (foreign/unknown frames and `?frame`/`?frameIndex`
+disagreements rejected) and cut into contiguous segments so no hidden temporal
+jumps appear. `--selection-query` requires `--experiment`.
+
+Shipped examples in `hw1/queries/`: `personal_passing_frames.rq` (frame policy
+— every selected factor passing, pair factor checked on its incoming edge) and
+`usable_links.rq` (explicit adjacent-link policy).
+
 ## Quality factors
 
 | Scope | Factor | Observable | Better |

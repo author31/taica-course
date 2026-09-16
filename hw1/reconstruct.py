@@ -18,7 +18,8 @@ EXPERIMENT IN, TWO RUNS OUT  (`--experiment <path.ttl>`)
     One experiment Turtle is BOTH the selection input and the result sink, so a
     run is self-describing: which frames, under which settings, produced which
     error. Everything RDF-shaped is delegated to hw1/api.py — `read_experiment`
-    on the way in, `write_run` on the way out (§8.2). This file
+    and its local-SPARQL usable-link selection on the way in, `write_run` on the
+    way out (§8.2). This file
     never parses Turtle and never re-derives the IRI scheme; the frame-IRI tail
     parse has exactly one implementation, `api.frame_index_from_iri`, and
     `read_experiment` calls it for us.
@@ -59,11 +60,22 @@ BASELINE AND SELECTED ARE TWO RUN NODES IN ONE EXPERIMENT
     full-batch baseline is the convergence outcome. Continuous values are the
     effect size; Pass/Fail is only the declared policy line.
 
+PERSONAL SPARQL SELECTION
+    `--selection-query <question.rq>` lets a student supply a local SPARQL
+    SELECT query over the assessed experiment instead of using the default
+    status-driven selected set. The query must bind `?frame` to HW1 frame IRIs
+    or `?frameIndex` to integer stems. Its result is checked against the frames
+    in the experiment and cut into contiguous segments before reconstruction;
+    arbitrary query results therefore cannot create hidden temporal jumps. The
+    baseline still runs by default, and the selected run records its actual
+    `hw1:usedFrame` provenance as usual.
+
 SELECTION IS STATUS-DRIVEN, AND THE STATUSES ARE ALREADY IN THE FILE
     `api.py experiment` baked a `hw1:Pass`/`hw1:Fail` next to every observable
     when it measured it (§4.3), against the QualificationSettings
-    recorded on the same experiment. So selection here is not a measurement and
-    not a query: `read_experiment` hands over `usable_links` — every pair whose
+    recorded on the same experiment. So selection here is not a measurement:
+    `read_experiment` runs the shared local SPARQL usable-link query and hands
+    over `usable_links` — every pair whose
     `hw1:qualificationStatus` is Pass (vacuously so when no pair factor was
     selected) AND whose two endpoint frames are usable, i.e. every annotation of
     theirs passed (vacuously so for a modality with no selected factor), §4.5 —
@@ -148,6 +160,7 @@ import sys
 import time
 import argparse
 import json
+import inspect
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -195,6 +208,137 @@ def _plan_selected(exp):
     print(f"[reconstruct] selection: {len(segments)} segment(s), {len(frames)} frames "
           f"[{spans}]")
     return frames, segments
+
+
+def _segments_from_frames(frames):
+    """Sorted frame indices -> maximal contiguous segments, including singletons."""
+    segments = []
+    for frame in sorted(set(int(value) for value in frames)):
+        if segments and frame == segments[-1][-1] + 1:
+            segments[-1].append(frame)
+        else:
+            segments.append([frame])
+    return segments
+
+
+def _plan_query_selected(exp, query_path):
+    """Select frames from a student's local SPARQL SELECT query.
+
+    The query must bind ``?frame`` (a HW1 frame IRI) or ``?frameIndex`` (an
+    integer). Results are constrained to frames known to this experiment, then
+    cut into contiguous segments so a personal assessment cannot silently create
+    unmeasured temporal jumps.
+    """
+    try:
+        with open(query_path, "r", encoding="utf-8") as handle:
+            query_text = handle.read()
+            result = _run_selection_query(exp, query_text)
+    except OSError as exc:
+        raise ValueError(f"cannot read --selection-query {query_path!r}: {exc}") from None
+    if result.type != "SELECT":
+        raise ValueError("--selection-query must be a SPARQL SELECT query that binds "
+                         "?frame or ?frameIndex")
+
+    names = {str(var): var for var in result.vars}
+    frame_var = names.get("frame")
+    index_var = names.get("frameIndex")
+    if frame_var is None and index_var is None:
+        raise ValueError("--selection-query must bind ?frame (a frame IRI) or "
+                         "?frameIndex (an integer)")
+
+    selected = set()
+    known_iris = _experiment_frame_iris(exp)
+    for row in result:
+        from_frame = None if frame_var is None else row[frame_var]
+        from_index = None if index_var is None else row[index_var]
+        if from_frame is None and from_index is None:
+            continue
+        try:
+            if from_frame is not None:
+                # Never accept a foreign frame merely because its IRI has the
+                # same numeric tail as a frame in this experiment.
+                if str(from_frame) not in known_iris:
+                    raise ValueError("frame is not a member of the selected experiment")
+                frame = _frame_index_for_iri(exp, from_frame)
+            else:
+                frame = int(from_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("--selection-query returned an invalid ?frame or "
+                             f"?frameIndex: {from_frame!r}, {from_index!r}") from exc
+        if from_frame is not None and from_index is not None:
+            try:
+                if frame != int(from_index):
+                    raise ValueError("--selection-query returned disagreeing ?frame and "
+                                     f"?frameIndex values: {from_frame!r}, {from_index!r}")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("--selection-query returned a non-integer ?frameIndex: "
+                                 f"{from_index!r}") from exc
+        selected.add(frame)
+
+    known = set(exp["frame_status"])
+    unknown = sorted(selected - known)
+    if unknown:
+        raise ValueError("--selection-query selected frame index/indices not present in "
+                         f"this experiment: {', '.join(map(str, unknown))}")
+    segments = _segments_from_frames(selected)
+    if not segments:
+        print("[reconstruct] personal SPARQL selection is EMPTY; no selected run written.")
+        return None, []
+    frames = [frame for segment in segments for frame in segment]
+    spans = ", ".join(f"{segment[0]}..{segment[-1]}({len(segment)})"
+                      for segment in segments[:8])
+    if len(segments) > 8:
+        spans += f", … +{len(segments) - 8} more"
+    print(f"[reconstruct] personal SPARQL selection: {len(segments)} segment(s), "
+          f"{len(frames)} frames [{spans}]")
+    return frames, segments
+
+
+def _experiment_frame_iris(exp):
+    """Return exact frame IRIs and indices from the assessed experiment graph."""
+    graph = exp["graph"]
+    hw1 = api.HW1
+    batch = graph.value(exp["exp_iri"], hw1.onBatch)
+    out = {}
+    if batch is None:
+        return out
+    for frame in graph.objects(batch, hw1.hasFrame):
+        index = graph.value(frame, hw1.frameIndex)
+        if index is not None:
+            out[str(frame)] = int(index)
+    return out
+
+
+def _frame_index_for_iri(exp, frame):
+    known = _experiment_frame_iris(exp)
+    try:
+        return known[str(frame)]
+    except KeyError:
+        raise ValueError(f"frame {frame!s} is not a member of the experiment batch") from None
+
+
+def _run_selection_query(exp, query_text):
+    """Run a policy with an exact experiment binding when supported by api."""
+    graph = exp["graph"]
+    experiment = exp.get("exp_iri")
+    query_fn = api.query_graph
+    try:
+        params = inspect.signature(query_fn).parameters
+        if experiment is not None and "bindings" in params:
+            return query_fn(graph, query_text, bindings={"experiment": experiment})
+        if experiment is not None and "init_bindings" in params:
+            return query_fn(graph, query_text,
+                            init_bindings={"experiment": experiment})
+    except (TypeError, ValueError):
+        pass
+    # Compatibility with the pre-refactor adapter.  The query templates still
+    # contain ?experiment; constrain it without changing student query text.
+    if experiment is not None:
+        try:
+            return graph.query(query_text, initBindings={"experiment": experiment})
+        except Exception as exc:
+            raise ValueError(f"invalid or unsupported SPARQL query: {exc}") from None
+    return query_fn(graph, query_text)
 
 
 def _score(data_root, version, frames, build_cloud, mode, map_voxel=None,
@@ -298,6 +442,11 @@ def main():
                              'frame selection in via the baked Pass/Fail statuses, run '
                              'values out, written below the machine marker. Omit for a '
                              'plain whole-batch visual run.')
+    parser.add_argument('--selection-query', metavar='QUERY.rq', default=None,
+                        help='student-authored local SPARQL SELECT query over --experiment. '
+                             'It must bind ?frame (frame IRI) or ?frameIndex (integer). '
+                             'Overrides the default baked-status selection for the selected run; '
+                             'results are cut into contiguous segments.')
     parser.add_argument('--no-write', action='store_true',
                         help='dry run: print the results but write nothing into the '
                              'experiment file')
@@ -330,7 +479,10 @@ def main():
     if args.experiment is None and args.selected_only:
         parser.error("--selected-only needs --experiment: the selection comes from the "
                      "Pass/Fail statuses baked into an experiment file "
-                     "(§4.5), and there is nothing to cut segments from without one.")
+                    "(§4.5), and there is nothing to cut segments from without one.")
+    if args.experiment is None and args.selection_query is not None:
+        parser.error("--selection-query requires --experiment: it queries that experiment's "
+                     "local RDF graph.")
 
     mask_factor = None
     if args.mask_dir is not None:
@@ -390,8 +542,16 @@ def main():
     plan = []
     if not args.selected_only:
         plan.append(("baseline", None, [], None, None))
-    if exp is not None and not args.baseline_only:
-        frames, segments = _plan_selected(exp)
+    # If PriorWarpDepthResidual is deferred, selection must be planned only
+    # after the baseline writes its evidence and the experiment is reloaded.
+    # Appending to this list from the baseline iteration keeps the execution
+    # order (baseline, then selected) while avoiding stale RDF state.
+    selection_deferred = (exp is not None and not args.baseline_only and
+                          "PriorWarpDepthResidual" in exp["selected"] and
+                          not args.selected_only)
+    if exp is not None and not args.baseline_only and not selection_deferred:
+        frames, segments = (_plan_query_selected(exp, args.selection_query)
+                            if args.selection_query is not None else _plan_selected(exp))
         if frames is not None:
             plan.append(("selected", frames, segments, None, None))
     if args.mask_dir is not None:
@@ -444,6 +604,15 @@ def main():
             api.write_pair_measurements(
                 args.experiment, "PriorWarpDepthResidual",
                 diagnostics.get("prior_warp_measurements", []))
+            # write_pair_measurements mutates the Turtle; reload through the
+            # canonical reader so qualification sees the persisted graph and
+            # completion state, not the pre-baseline in-memory snapshot.
+            exp = api.read_experiment(args.experiment)
+            if selection_deferred:
+                frames, segments = (_plan_query_selected(exp, args.selection_query)
+                                    if args.selection_query is not None else _plan_selected(exp))
+                if frames is not None:
+                    plan.append(("selected", frames, segments, None, None))
 
         diagnostic_file = _write_link_diagnostics(
             args.experiment, mode, diagnostics)
